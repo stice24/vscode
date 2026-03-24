@@ -4,7 +4,9 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { Disposable, DisposableStore } from '../../../../base/common/lifecycle.js';
+import { Emitter, Event } from '../../../../base/common/event.js';
 import * as dom from '../../../../base/browser/dom.js';
+import { mainWindow } from '../../../../base/browser/window.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -20,10 +22,205 @@ const DEFAULT_WIDTH = 400;
 const DEFAULT_HEIGHT = 460;
 
 /**
- * Z-index that places the bubble above the editor surface (suggest: 40) but
+ * Z-index above the editor surface (suggest: 40, arrow: 49) but
  * below notifications / dialogs (10000+).
  */
 const BUBBLE_Z_INDEX = 50;
+
+// ---------------------------------------------------------------------------
+// Style injection — runs once per page lifetime
+// ---------------------------------------------------------------------------
+
+let _widgetStylesInjected = false;
+
+function ensureWidgetStyles(): void {
+	if (_widgetStylesInjected) {
+		return;
+	}
+	_widgetStylesInjected = true;
+
+	const style = document.createElement('style');
+	style.textContent = `
+
+/* ---- Root widget ---- */
+.context-bubble-widget {
+	position: absolute;
+	z-index: ${BUBBLE_Z_INDEX};
+	display: none;
+	flex-direction: column;
+	background: linear-gradient(180deg, #111318 0%, #0d0f12 100%);
+	border-radius: 14px;
+	box-shadow:
+		0 0 0 1px rgba(80, 200, 220, 0.13),
+		0 2px 10px rgba(0, 0, 0, 0.65),
+		0 16px 52px rgba(0, 0, 0, 0.55);
+	overflow: hidden;
+	user-select: none;
+	box-sizing: border-box;
+	transition: box-shadow 0.2s ease;
+}
+.context-bubble-widget.is-hovered {
+	box-shadow:
+		0 0 0 1px rgba(80, 200, 220, 0.28),
+		0 2px 10px rgba(0, 0, 0, 0.65),
+		0 16px 52px rgba(0, 0, 0, 0.55);
+}
+.context-bubble-widget.is-dragging {
+	box-shadow:
+		0 0 0 1px rgba(80, 200, 220, 0.42),
+		0 0 24px rgba(80, 200, 220, 0.07),
+		0 6px 20px rgba(0, 0, 0, 0.75),
+		0 24px 64px rgba(0, 0, 0, 0.6);
+	transition: none;
+}
+
+/* ---- Chrome bar ---- */
+.context-bubble-chrome {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	padding: 7px 12px;
+	background: rgba(20, 23, 30, 0.98);
+	border-bottom: 1px solid rgba(80, 200, 220, 0.07);
+	cursor: move;
+	flex-shrink: 0;
+	gap: 8px;
+}
+
+.context-bubble-title {
+	font-size: 10px;
+	font-weight: 500;
+	text-transform: uppercase;
+	letter-spacing: 0.1em;
+	color: rgba(180, 190, 200, 0.45);
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	flex: 1;
+	font-family: system-ui, -apple-system, sans-serif;
+}
+
+.context-bubble-controls {
+	display: flex;
+	gap: 2px;
+	flex-shrink: 0;
+}
+
+.context-bubble-btn-hide,
+.context-bubble-btn-close {
+	background: none;
+	border: none;
+	cursor: pointer;
+	color: rgba(210, 220, 230, 0.95);
+	font-size: 14px;
+	line-height: 1;
+	padding: 2px 5px;
+	border-radius: 3px;
+	opacity: 0.45;
+	transition: opacity 0.15s, background 0.1s;
+}
+.context-bubble-widget.is-hovered .context-bubble-btn-hide,
+.context-bubble-widget.is-hovered .context-bubble-btn-close {
+	opacity: 0.85;
+}
+.context-bubble-btn-hide:hover,
+.context-bubble-btn-close:hover {
+	opacity: 1 !important;
+	background: rgba(255, 255, 255, 0.1);
+}
+
+/* ---- Slots container ---- */
+.context-bubble-slots {
+	flex: 1;
+	display: flex;
+	flex-direction: column;
+	overflow: hidden;
+	min-height: 0;
+	-webkit-mask-image:
+		linear-gradient(to right, transparent 0px, black 10px, black calc(100% - 10px), transparent 100%),
+		linear-gradient(to bottom, black 0%, black calc(100% - 26px), transparent 100%);
+	-webkit-mask-composite: destination-in;
+	mask-image:
+		linear-gradient(to right, transparent 0px, black 10px, black calc(100% - 10px), transparent 100%),
+		linear-gradient(to bottom, black 0%, black calc(100% - 26px), transparent 100%);
+	mask-composite: intersect;
+}
+
+/* ---- Slot dividers (gradient separator between adjacent slots) ---- */
+.context-bubble-slot + .context-bubble-slot::before {
+	content: '';
+	display: block;
+	height: 1px;
+	flex-shrink: 0;
+	background: linear-gradient(
+		to right,
+		transparent 0%,
+		rgba(80, 200, 220, 0.18) 20%,
+		rgba(80, 200, 220, 0.18) 80%,
+		transparent 100%
+	);
+}
+
+/* ---- Slot label (used by SlotComponent subclasses) ---- */
+.slot-label {
+	font-size: 9px;
+	text-transform: uppercase;
+	letter-spacing: 0.1em;
+	color: rgba(180, 190, 200, 0.3);
+	padding: 7px 14px 3px;
+	font-family: system-ui, -apple-system, sans-serif;
+	flex-shrink: 0;
+}
+
+/* ---- Resize handles ---- */
+.context-bubble-resize-handle {
+	position: absolute;
+	opacity: 0;
+	z-index: 2;
+	transition: opacity 0.15s;
+}
+.context-bubble-widget.is-border-hovered .context-bubble-resize-handle {
+	opacity: 1;
+}
+/* Cyan tint on active resize handle */
+.context-bubble-resize-handle:active {
+	background: rgba(80, 200, 220, 0.12) !important;
+	opacity: 1 !important;
+}
+
+/* ---- Slot configuration overlay ---- */
+.context-bubble-config-overlay {
+	position: absolute;
+	inset: 0;
+	display: none;
+	flex-direction: column;
+	gap: 4px;
+	padding: 42px 6px 6px;
+	background: rgba(60, 80, 100, 0.07);
+	border-radius: 13px;
+	z-index: 10;
+	pointer-events: none;
+	backdrop-filter: blur(1px);
+}
+.context-bubble-config-overlay.is-active {
+	display: flex;
+	pointer-events: auto;
+}
+.context-bubble-drop-zone {
+	flex: 1;
+	border: 1px dashed rgba(80, 200, 220, 0.2);
+	border-radius: 8px;
+	transition: border-color 0.15s, box-shadow 0.15s, background 0.15s;
+}
+.context-bubble-drop-zone.drag-over {
+	border-color: rgba(80, 200, 220, 0.55);
+	background: rgba(80, 200, 220, 0.05);
+	box-shadow: inset 0 0 14px rgba(80, 200, 220, 0.08);
+}
+
+`;
+	mainWindow.document.head.appendChild(style);
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -67,8 +264,22 @@ export class ContextBubbleWidget extends Disposable {
 
 	private readonly _element: HTMLElement;
 	private readonly _slotsContainer: HTMLElement;
+	private readonly _configOverlay: HTMLElement;
 	private readonly _resizeHandleElements: HTMLElement[] = [];
 	private readonly _disposables = this._register(new DisposableStore());
+
+	private readonly _onDidMove = this._register(new Emitter<void>());
+	private readonly _onDidClose = this._register(new Emitter<void>());
+	private readonly _onDidInteract = this._register(new Emitter<void>());
+
+	/** Fires on every `mousemove` during a drag — use to update the arrow. */
+	readonly onDidMove: Event<void> = this._onDidMove.event;
+
+	/** Fires when the user closes the bubble via the "×" button. */
+	readonly onDidClose: Event<void> = this._onDidClose.event;
+
+	/** Fires on any `mousedown` on the bubble element. */
+	readonly onDidInteract: Event<void> = this._onDidInteract.event;
 
 	private _x = 100;
 	private _y = 100;
@@ -81,10 +292,14 @@ export class ContextBubbleWidget extends Disposable {
 
 	constructor(private readonly _container: HTMLElement) {
 		super();
+		ensureWidgetStyles();
 		this._slotsContainer = this._buildSlotsContainer();
+		this._configOverlay = this._buildConfigOverlay();
 		this._element = this._buildElement();
 		this._container.appendChild(this._element);
+		this._bindHover();
 		this._bindBorderHover();
+		this._bindInteract();
 	}
 
 	// -------------------------------------------------------------------------
@@ -100,7 +315,7 @@ export class ContextBubbleWidget extends Disposable {
 	/**
 	 * Collapse to hidden state.
 	 * Position and slot data are preserved in memory.
-	 * The gutter anchor (added in a later session) remains visible.
+	 * The gutter anchor remains visible.
 	 */
 	hide(): void {
 		this._visible = false;
@@ -108,10 +323,11 @@ export class ContextBubbleWidget extends Disposable {
 	}
 
 	/**
-	 * Destroy the bubble entirely.
+	 * Destroy the bubble entirely — fires `onDidClose` before disposal.
 	 * Removes the DOM element and disposes all listeners.
 	 */
 	close(): void {
+		this._onDidClose.fire();
 		this.dispose();
 	}
 
@@ -123,6 +339,11 @@ export class ContextBubbleWidget extends Disposable {
 		this._element.style.top = `${y}px`;
 	}
 
+	/** Current container-relative position. */
+	getPosition(): { x: number; y: number } {
+		return { x: this._x, y: this._y };
+	}
+
 	get isVisible(): boolean {
 		return this._visible;
 	}
@@ -131,9 +352,22 @@ export class ContextBubbleWidget extends Disposable {
 		return this._element;
 	}
 
-	/** The element that slot components should append themselves to. */
+	/** The element that SlotComponent subclasses should append themselves to. */
 	getSlotsContainer(): HTMLElement {
 		return this._slotsContainer;
+	}
+
+	/**
+	 * Activates the slot-rearrangement configuration overlay.
+	 * Drop zones become interactive and accept slot drag-and-drop.
+	 */
+	enterConfigMode(): void {
+		this._configOverlay.classList.add('is-active');
+	}
+
+	/** Deactivates the configuration overlay. */
+	exitConfigMode(): void {
+		this._configOverlay.classList.remove('is-active');
 	}
 
 	// -------------------------------------------------------------------------
@@ -145,26 +379,17 @@ export class ContextBubbleWidget extends Disposable {
 		root.className = 'context-bubble-widget';
 		root.setAttribute('role', 'dialog');
 		root.setAttribute('aria-label', 'Context Bubble');
+		// Dynamic properties only — visual styles come from the injected stylesheet
 		root.style.cssText = [
-			'position: absolute',
 			`left: ${this._x}px`,
 			`top: ${this._y}px`,
 			`width: ${this._width}px`,
 			`height: ${this._height}px`,
-			`z-index: ${BUBBLE_Z_INDEX}`,
-			'display: none',
-			'flex-direction: column',
-			'background: var(--vscode-editorWidget-background, #1e1e1e)',
-			'border: 1px solid var(--vscode-editorWidget-border, #454545)',
-			'border-radius: 6px',
-			'box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4)',
-			'overflow: hidden',
-			'user-select: none',
-			'box-sizing: border-box',
 		].join('; ');
 
 		root.appendChild(this._buildChrome());
 		root.appendChild(this._slotsContainer);
+		root.appendChild(this._configOverlay);
 
 		for (const handle of ALL_RESIZE_HANDLES) {
 			const el = this._buildResizeHandle(handle);
@@ -178,33 +403,13 @@ export class ContextBubbleWidget extends Disposable {
 	private _buildChrome(): HTMLElement {
 		const chrome = document.createElement('div');
 		chrome.className = 'context-bubble-chrome';
-		chrome.style.cssText = [
-			'display: flex',
-			'align-items: center',
-			'justify-content: space-between',
-			'padding: 6px 10px',
-			'background: var(--vscode-titleBar-activeBackground, #3c3c3c)',
-			'cursor: move',
-			'flex-shrink: 0',
-			'gap: 8px',
-		].join('; ');
 
 		const title = document.createElement('span');
 		title.className = 'context-bubble-title';
 		title.textContent = 'Context Bubble';
-		title.style.cssText = [
-			'font-size: 12px',
-			'font-weight: 600',
-			'color: var(--vscode-foreground, #cccccc)',
-			'white-space: nowrap',
-			'overflow: hidden',
-			'text-overflow: ellipsis',
-			'flex: 1',
-		].join('; ');
 
 		const controls = document.createElement('span');
 		controls.className = 'context-bubble-controls';
-		controls.style.cssText = 'display: flex; gap: 4px; flex-shrink: 0;';
 
 		controls.appendChild(this._buildChromeButton('\u2212', 'context-bubble-btn-hide', () => this.hide()));
 		controls.appendChild(this._buildChromeButton('\u00d7', 'context-bubble-btn-close', () => this.close()));
@@ -212,7 +417,6 @@ export class ContextBubbleWidget extends Disposable {
 		chrome.appendChild(title);
 		chrome.appendChild(controls);
 
-		// Drag is initiated from the chrome bar
 		this._disposables.add(dom.addDisposableListener(chrome, 'mousedown', e => this._onDragStart(e)));
 
 		return chrome;
@@ -222,17 +426,6 @@ export class ContextBubbleWidget extends Disposable {
 		const btn = document.createElement('button');
 		btn.className = className;
 		btn.textContent = label;
-		btn.style.cssText = [
-			'background: none',
-			'border: none',
-			'cursor: pointer',
-			'color: var(--vscode-foreground, #cccccc)',
-			'font-size: 14px',
-			'line-height: 1',
-			'padding: 2px 4px',
-			'opacity: 0.7',
-			'border-radius: 3px',
-		].join('; ');
 		this._disposables.add(dom.addDisposableListener(btn, 'click', e => {
 			e.stopPropagation();
 			handler();
@@ -243,14 +436,22 @@ export class ContextBubbleWidget extends Disposable {
 	private _buildSlotsContainer(): HTMLElement {
 		const el = document.createElement('div');
 		el.className = 'context-bubble-slots';
-		el.style.cssText = [
-			'flex: 1',
-			'display: flex',
-			'flex-direction: column',
-			'overflow: hidden',
-			'min-height: 0',
-		].join('; ');
 		return el;
+	}
+
+	private _buildConfigOverlay(): HTMLElement {
+		const overlay = document.createElement('div');
+		overlay.className = 'context-bubble-config-overlay';
+
+		// 3 drop zones — one per default slot position
+		for (let i = 0; i < 3; i++) {
+			const zone = document.createElement('div');
+			zone.className = 'context-bubble-drop-zone';
+			zone.dataset['zoneIndex'] = String(i);
+			overlay.appendChild(zone);
+		}
+
+		return overlay;
 	}
 
 	private _buildResizeHandle(handle: ResizeHandle): HTMLElement {
@@ -263,30 +464,60 @@ export class ContextBubbleWidget extends Disposable {
 			s: 's-resize', sw: 'sw-resize', w: 'w-resize', nw: 'nw-resize',
 		};
 
-		const t = 6;  // thickness / corner size in pixels
+		const t = 6;
+		const positionMap: Record<ResizeHandle, string> = {
+			n: `top: 0; left: ${t}px; right: ${t}px; height: ${t}px;`,
+			s: `bottom: 0; left: ${t}px; right: ${t}px; height: ${t}px;`,
+			e: `right: 0; top: ${t}px; bottom: ${t}px; width: ${t}px;`,
+			w: `left: 0; top: ${t}px; bottom: ${t}px; width: ${t}px;`,
+			nw: `top: 0; left: 0; width: ${t * 2}px; height: ${t * 2}px;`,
+			ne: `top: 0; right: 0; width: ${t * 2}px; height: ${t * 2}px;`,
+			se: `bottom: 0; right: 0; width: ${t * 2}px; height: ${t * 2}px;`,
+			sw: `bottom: 0; left: 0; width: ${t * 2}px; height: ${t * 2}px;`,
+		};
+		const positionStyle = positionMap[handle];
 
-		const positionStyle =
-			handle === 'n' ? `top: 0; left: ${t}px; right: ${t}px; height: ${t}px;` :
-				handle === 's' ? `bottom: 0; left: ${t}px; right: ${t}px; height: ${t}px;` :
-					handle === 'e' ? `right: 0; top: ${t}px; bottom: ${t}px; width: ${t}px;` :
-						handle === 'w' ? `left: 0; top: ${t}px; bottom: ${t}px; width: ${t}px;` :
-							handle === 'nw' ? `top: 0; left: 0; width: ${t * 2}px; height: ${t * 2}px;` :
-								handle === 'ne' ? `top: 0; right: 0; width: ${t * 2}px; height: ${t * 2}px;` :
-									handle === 'se' ? `bottom: 0; right: 0; width: ${t * 2}px; height: ${t * 2}px;` :
-			/* sw */          `bottom: 0; left: 0; width: ${t * 2}px; height: ${t * 2}px;`;
-
-		el.style.cssText = [
-			'position: absolute',
-			`cursor: ${cursorMap[handle]}`,
-			'opacity: 0',
-			'transition: opacity 0.15s',
-			'z-index: 2',
-			positionStyle,
-		].join('; ');
+		el.style.cssText = [`cursor: ${cursorMap[handle]}`, positionStyle].join('; ');
 
 		this._disposables.add(dom.addDisposableListener(el, 'mousedown', e => this._onResizeStart(e, handle)));
 
 		return el;
+	}
+
+	// -------------------------------------------------------------------------
+	// Hover / state management
+	// -------------------------------------------------------------------------
+
+	private _bindHover(): void {
+		this._disposables.add(dom.addDisposableListener(this._element, 'mouseenter', () => {
+			this._element.classList.add('is-hovered');
+		}));
+		this._disposables.add(dom.addDisposableListener(this._element, 'mouseleave', () => {
+			this._element.classList.remove('is-hovered');
+		}));
+	}
+
+	private _bindBorderHover(): void {
+		this._disposables.add(dom.addDisposableListener(this._element, 'mousemove', e => {
+			const rect = this._element.getBoundingClientRect();
+			const edgeThreshold = 10;
+			const nearEdge =
+				e.clientX - rect.left < edgeThreshold ||
+				rect.right - e.clientX < edgeThreshold ||
+				e.clientY - rect.top < edgeThreshold ||
+				rect.bottom - e.clientY < edgeThreshold;
+			this._element.classList.toggle('is-border-hovered', nearEdge);
+		}));
+		this._disposables.add(dom.addDisposableListener(this._element, 'mouseleave', () => {
+			this._element.classList.remove('is-border-hovered');
+		}));
+	}
+
+	private _bindInteract(): void {
+		// Any mousedown on the widget is an "interaction" — used to dismiss the arrow
+		this._disposables.add(dom.addDisposableListener(this._element, 'mousedown', () => {
+			this._onDidInteract.fire();
+		}));
 	}
 
 	// -------------------------------------------------------------------------
@@ -304,12 +535,13 @@ export class ContextBubbleWidget extends Disposable {
 			startElemX: this._x,
 			startElemY: this._y,
 		};
+		this._element.classList.add('is-dragging');
 
 		const win = dom.getWindow(this._element);
-		// Temporary listeners are NOT registered to _disposables — they self-dispose on mouseup
 		const moveDisposable = dom.addDisposableListener(win, 'mousemove', mv => this._onDragMove(mv));
 		const upDisposable = dom.addDisposableListener(win, 'mouseup', () => {
 			this._dragState = null;
+			this._element.classList.remove('is-dragging');
 			moveDisposable.dispose();
 			upDisposable.dispose();
 		});
@@ -326,34 +558,12 @@ export class ContextBubbleWidget extends Disposable {
 		// Direct style mutation — no state-update cycle in the hot path
 		this._element.style.left = `${this._x}px`;
 		this._element.style.top = `${this._y}px`;
+		this._onDidMove.fire();
 	}
 
 	// -------------------------------------------------------------------------
 	// Resize
 	// -------------------------------------------------------------------------
-
-	/** Show resize handles when the pointer is near the bubble border. */
-	private _bindBorderHover(): void {
-		this._disposables.add(dom.addDisposableListener(this._element, 'mousemove', e => {
-			const rect = this._element.getBoundingClientRect();
-			const edgeThreshold = 10;
-			const nearEdge =
-				e.clientX - rect.left < edgeThreshold ||
-				rect.right - e.clientX < edgeThreshold ||
-				e.clientY - rect.top < edgeThreshold ||
-				rect.bottom - e.clientY < edgeThreshold;
-			this._setHandlesVisible(nearEdge);
-		}));
-		this._disposables.add(dom.addDisposableListener(this._element, 'mouseleave', () => {
-			this._setHandlesVisible(false);
-		}));
-	}
-
-	private _setHandlesVisible(visible: boolean): void {
-		for (const handle of this._resizeHandleElements) {
-			handle.style.opacity = visible ? '1' : '0';
-		}
-	}
 
 	private _onResizeStart(e: MouseEvent, handle: ResizeHandle): void {
 		if (e.button !== 0) {

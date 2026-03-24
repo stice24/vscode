@@ -3,99 +3,253 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { Disposable, MutableDisposable } from '../../../../base/common/lifecycle.js';
+import { Disposable, DisposableStore, MutableDisposable } from '../../../../base/common/lifecycle.js';
 import { mainWindow } from '../../../../base/browser/window.js';
+import { ICodeEditor } from '../../../../editor/browser/editorBrowser.js';
 import { ICodeEditorService } from '../../../../editor/browser/services/codeEditorService.js';
 import { IWorkbenchLayoutService } from '../../../services/layout/browser/layoutService.js';
 import { CommandsRegistry } from '../../../../platform/commands/common/commands.js';
 import { ContextBubbleWidget } from './contextBubbleWidget.js';
+import { ContextBubbleAnchor } from './contextBubbleAnchor.js';
+import { ContextBubbleArrow } from './contextBubbleArrow.js';
 
 export const CONTEXT_BUBBLE_COMMAND_ID = 'contextBubble.trigger';
 
+/** Default bubble dimensions — kept in sync with constants in contextBubbleWidget.ts. */
+const DEFAULT_WIDTH = 400;
+const DEFAULT_HEIGHT = 460;
+
 /**
- * Workbench contribution that owns the context bubble lifecycle.
+ * Workbench contribution that owns the full context bubble lifecycle.
  *
- * Responsibilities:
- * - Registers the command that the keybinding fires
- * - Resolves the active editor and highlighted symbol position on trigger
- * - Owns the single ContextBubbleWidget instance (one bubble at a time, UX constraint)
- * - Handles re-expand when a hidden bubble already exists
+ * **Interaction flow**
+ * 1. Hotkey → places the gutter anchor "+" at the trigger line. Bubble is NOT shown yet.
+ * 2. User clicks "+" → bubble opens in open space, bezier arrow appears.
+ * 3. "minus" button → bubble hidden, anchor stays so user can click "+" to restore.
+ * 4. "×" button → everything torn down (bubble + anchor + arrow).
+ * 5. Hotkey while bubble is hidden → re-expands the hidden bubble.
  */
 export class ContextBubbleController extends Disposable {
 
 	static readonly ID = 'workbench.contrib.contextBubble';
 
-	/**
-	 * MutableDisposable ensures previous bubble is fully cleaned up before a new
-	 * one is created, and is disposed automatically when the controller shuts down.
-	 * Do not use `this._register(new ContextBubbleWidget(...))` inside a
-	 * repeatedly-called method — that would accumulate stale disposables.
-	 */
 	private readonly _bubbleSlot = this._register(new MutableDisposable<ContextBubbleWidget>());
+	private readonly _anchorSlot = this._register(new MutableDisposable<ContextBubbleAnchor>());
+	private readonly _arrowSlot = this._register(new MutableDisposable<ContextBubbleArrow>());
+
+	/**
+	 * Subscriptions scoped to the current session (anchor + bubble + arrow).
+	 * Cleared entirely on teardown so nothing outlives the session.
+	 */
+	private readonly _sessionDisposables = this._register(new DisposableStore());
+
+	/**
+	 * The editor that owns the current anchor.
+	 * Stored so scroll events can be wired without re-capturing the editor context.
+	 */
+	private _anchoredEditor: ICodeEditor | undefined;
 
 	constructor(
 		@IWorkbenchLayoutService private readonly _layoutService: IWorkbenchLayoutService,
 		@ICodeEditorService private readonly _codeEditorService: ICodeEditorService,
 	) {
 		super();
-
-		// Register the command handler. The keybinding rule (defined in
-		// contextBubble.contribution.ts) binds the hotkey to this command ID.
 		this._register(CommandsRegistry.registerCommand(CONTEXT_BUBBLE_COMMAND_ID, () => {
 			this._triggerBubble();
 		}));
 	}
 
 	// -------------------------------------------------------------------------
-	// Trigger
+	// Hotkey handler — anchor only
 	// -------------------------------------------------------------------------
 
 	private _triggerBubble(): void {
-		const existing = this._bubbleSlot.value;
+		const existingBubble = this._bubbleSlot.value;
 
-		// Re-expand a hidden bubble instead of creating a new one
-		if (existing && !existing.isVisible) {
-			existing.show();
+		// Hotkey while bubble is hidden → re-expand it (same as clicking "+")
+		if (existingBubble && !existingBubble.isVisible) {
+			this._openBubble();
 			return;
 		}
 
-		// Only one bubble at a time — assigning a new value disposes the previous one
-		const position = this._resolveSymbolScreenPosition();
+		// Bubble already visible, or anchor already placed — nothing to do
+		if (existingBubble?.isVisible || this._anchorSlot.value) {
+			return;
+		}
+
+		// First press: place the anchor, do not open the bubble yet
+		const editorContext = this._resolveEditorContext();
+		if (!editorContext) {
+			return;
+		}
+
+		const anchor = new ContextBubbleAnchor(editorContext.editor, editorContext.lineNumber);
+		this._anchorSlot.value = anchor;
+		this._anchoredEditor = editorContext.editor;
+
+		// Anchor click always opens (or re-opens) the bubble
+		this._sessionDisposables.add(anchor.onDidClick(() => this._openBubble()));
+
+		// Keep arrow in sync when the anchor scrolls with the code
+		this._sessionDisposables.add(
+			editorContext.editor.onDidScrollChange(() => this._updateArrow())
+		);
+	}
+
+	// -------------------------------------------------------------------------
+	// Bubble open — called from anchor click and hotkey re-expand
+	// -------------------------------------------------------------------------
+
+	private _openBubble(): void {
 		const container = this._layoutService.getContainer(mainWindow);
 
+		// Always create a fresh arrow — the previous one may have already faded
+		const arrow = new ContextBubbleArrow(container);
+		this._arrowSlot.value = arrow;
+
+		const existingBubble = this._bubbleSlot.value;
+		if (existingBubble) {
+			// Re-show the hidden bubble at its last dragged position
+			this._updateArrow();
+			existingBubble.show();
+			return;
+		}
+
+		// Create new bubble positioned in open (unoccupied) space
 		const bubble = new ContextBubbleWidget(container);
 		this._bubbleSlot.value = bubble;
 
-		if (position) {
-			// Offset the bubble slightly right and below the trigger line
-			const containerRect = container.getBoundingClientRect();
-			const bubbleX = Math.max(0, position.viewportX - containerRect.left + 24);
-			const bubbleY = Math.max(0, position.viewportY - containerRect.top);
-			bubble.setPosition(bubbleX, bubbleY);
-		}
+		const openPos = this._resolveOpenSpacePosition(container);
+		bubble.setPosition(openPos.x, openPos.y);
+
+		// Draw the initial arrow
+		this._updateArrow();
+
+		// Bubble drag → update arrow path in real time (timer keeps running)
+		this._sessionDisposables.add(bubble.onDidMove(() => this._updateArrow()));
+
+		// "×" closes bubble AND tears down the full session (including anchor)
+		this._sessionDisposables.add(bubble.onDidClose(() => this._teardownSession()));
 
 		bubble.show();
+	}
+
+	// -------------------------------------------------------------------------
+	// Arrow update
+	// -------------------------------------------------------------------------
+
+	private _updateArrow(): void {
+		const arrow = this._arrowSlot.value;
+		const bubble = this._bubbleSlot.value;
+		const anchor = this._anchorSlot.value;
+		if (!arrow || !bubble) {
+			return;
+		}
+
+		const container = this._layoutService.getContainer(mainWindow);
+		const containerRect = container.getBoundingClientRect();
+
+		// Endpoint B: left edge of bubble, vertically at chrome-bar centre (~23px)
+		const bubblePos = bubble.getPosition();
+		const to = {
+			x: bubblePos.x,
+			y: bubblePos.y + 23,
+		};
+
+		// Endpoint A: anchor glyph centre, converted to container-relative coords
+		if (anchor) {
+			const anchorViewport = anchor.getViewportPosition();
+			if (anchorViewport) {
+				const from = {
+					x: anchorViewport.x - containerRect.left,
+					y: anchorViewport.y - containerRect.top,
+				};
+				arrow.update(from, to);
+				return;
+			}
+		}
+
+		// Anchor is off-screen: collapse the path to a point so the arrow is invisible
+		arrow.update(to, to);
+	}
+
+	// -------------------------------------------------------------------------
+	// Open-space placement
+	// -------------------------------------------------------------------------
+
+	/**
+	 * Computes the initial bubble position in unoccupied horizontal space —
+	 * to the right of the editor text content area, vertically aligned near
+	 * the anchor line.
+	 *
+	 * Falls back to a safe position if editor layout is unavailable.
+	 */
+	private _resolveOpenSpacePosition(container: HTMLElement): { x: number; y: number } {
+		const containerRect = container.getBoundingClientRect();
+		const editor = this._anchoredEditor;
+		const anchor = this._anchorSlot.value;
+
+		const fallback = { x: 60, y: 60 };
+
+		if (!editor) {
+			return fallback;
+		}
+
+		const editorDomNode = editor.getDomNode();
+		if (!editorDomNode) {
+			return fallback;
+		}
+
+		const editorRect = editorDomNode.getBoundingClientRect();
+		const layout = editor.getLayoutInfo();
+
+		// Right edge of text content in container-relative coordinates
+		const contentRightContainer =
+			editorRect.left + layout.contentLeft + layout.contentWidth - containerRect.left;
+
+		// Place bubble flush against the text right edge with a small gap
+		const preferredX = contentRightContainer + 20;
+		const maxX = containerRect.width - DEFAULT_WIDTH - 10;
+		const x = Math.min(preferredX, Math.max(10, maxX));
+
+		// Vertically: centre the bubble on the anchor line, clamped inside container
+		let anchorContainerY = editorRect.top - containerRect.top + 100; // fallback
+		if (anchor) {
+			const anchorViewport = anchor.getViewportPosition();
+			if (anchorViewport) {
+				anchorContainerY = anchorViewport.y - containerRect.top;
+			}
+		}
+		const y = Math.max(10, Math.min(
+			anchorContainerY - DEFAULT_HEIGHT / 3,
+			containerRect.height - DEFAULT_HEIGHT - 10,
+		));
+
+		return { x, y };
+	}
+
+	// -------------------------------------------------------------------------
+	// Session teardown (only caled on x)
+	// -------------------------------------------------------------------------
+
+	private _teardownSession(): void {
+		this._sessionDisposables.clear();
+		this._anchoredEditor = undefined;
+		this._anchorSlot.value = undefined;
+		this._arrowSlot.value = undefined;
+		this._bubbleSlot.value = undefined;
 	}
 
 	// -------------------------------------------------------------------------
 	// Coordinate resolution
 	// -------------------------------------------------------------------------
 
-	/**
-	 * Resolves the viewport-relative screen position of the start of the
-	 * current editor selection, using existing editor infrastructure.
-	 *
-	 * Combination of:
-	 * - `ICodeEditor.getScrolledVisiblePosition` — position relative to editor DOM node
-	 * - `getBoundingClientRect` on the editor DOM node — editor's viewport position
-	 *
-	 * Returns `undefined` when no focused editor or selection is available.
-	 */
-	private _resolveSymbolScreenPosition(): { viewportX: number; viewportY: number } | undefined {
-		// Prefer the focused editor (user just interacted with it)
+	private _resolveEditorContext(): {
+		editor: ICodeEditor;
+		lineNumber: number;
+	} | undefined {
 		const editor = this._codeEditorService.getFocusedCodeEditor()
 			?? this._codeEditorService.getActiveCodeEditor();
-
 		if (!editor) {
 			return undefined;
 		}
@@ -105,28 +259,9 @@ export class ContextBubbleController extends Disposable {
 			return undefined;
 		}
 
-		// getScrolledVisiblePosition returns coordinates relative to the editor
-		// DOM node's top-left corner, accounting for current scroll offset.
-		const scrolledPos = editor.getScrolledVisiblePosition({
-			lineNumber: selection.selectionStartLineNumber,
-			column: selection.selectionStartColumn,
-		});
-		if (!scrolledPos) {
-			return undefined;
-		}
-
-		const editorDomNode = editor.getDomNode();
-		if (!editorDomNode) {
-			return undefined;
-		}
-
-		// getBoundingClientRect converts to viewport-relative coordinates
-		const editorRect = editorDomNode.getBoundingClientRect();
-
 		return {
-			viewportX: editorRect.left + scrolledPos.left,
-			// Place the bubble just below the trigger line
-			viewportY: editorRect.top + scrolledPos.top + scrolledPos.height,
+			editor,
+			lineNumber: selection.selectionStartLineNumber,
 		};
 	}
 
@@ -135,7 +270,6 @@ export class ContextBubbleController extends Disposable {
 	// -------------------------------------------------------------------------
 
 	override dispose(): void {
-		// _bubbleSlot is registered and will be disposed by super.dispose()
 		super.dispose();
 	}
 }

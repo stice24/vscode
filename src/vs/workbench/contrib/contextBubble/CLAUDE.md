@@ -14,11 +14,12 @@ This is a **UI-first product**. The spatial, in-context bubble experience is the
 
 ## Repository Context
 
-- This is a fork of **Code OSS** (MIT-licensed upstream of VS Code / Kiro IDE)
+- This is a fork of **Code OSS** (MIT-licensed upstream of VS Code)
 - The fork exists to build the full vision without extension API constraints
 - A VS Code extension extraction may happen later for distribution — do not design against that now
 - Phase 1 (fork setup, dev loop validation) is complete
 - Phase 2 (context bubble implementation) is active
+- Sessions 1 and 2 are complete — scaffold, drag/resize, anchor, arrow, and core aesthetic are built
 
 ---
 
@@ -51,25 +52,25 @@ This is a **UI-first product**. The spatial, in-context bubble experience is the
 ## The Interaction Model
 
 ### Trigger (Stage 1)
-- Developer highlights a function → hits hotkey
-- A small anchor element ("+") appears near the function header, pinned to that line
-- Tagged along with this ("+"), cleanly with respect to UI, is ("Context Bubble"), highlighted in a little shape, just make it look clean
-- **Data prefetch begins immediately at this point** — do not wait for the bubble to open
-- The anchor behaves as a gutter decoration — it scrolls with the code
+- Developer highlights a function → hits hotkey (Shift-CMD-J)
+- A small anchor element ("+") appears near the function header, pinned to that line, as a gutter decoration that scrolls with the code
+- Tagged alongside the "+", cleanly with respect to UI, is a "Context Bubble" label highlighted in a small shape — keep it clean
+- **Data prefetch begins immediately at trigger** — do not wait for the bubble to open
 
 ### Open (Stage 2)
 - Developer drags from the anchor → bubble expands and follows
 - On drop, bubble is placed at that position and fully opens
-- A bezier curve arrow connects anchor to bubble
-- Arrow fades out after **5 seconds** with an ~800ms ease-out opacity transition
+- A bezier curve SVG arrow connects anchor to bubble, rendered in an absolutely positioned SVG layer between the editor and the bubble
+- Arrow is cool blue/cyan, low opacity, thin stroke
+- Arrow fades out after **5 seconds** with an 800ms ease-out opacity transition
 - Arrow also disappears immediately on any interaction with the bubble
 
 ### Drag and Resize
 - Position updates run directly against `element.style` on `mousemove` — no state update cycle in the hot path
-- Resize handles appear on hover of bubble border — not permanently visible
+- Resize handles appear on bubble border hover only — not permanently visible, subtle cyan tint when active
 - Minimum bubble size enforced so slots remain readable
 - **No snap-to-grid** — free floating only
-- Users will be able to configure the elements of the context bubble, which can be rearranged. They're masked into the space chosen by the developer
+- Glow intensifies slightly while dragging — no other visual change during drag
 - Satisfying feel is a requirement, not a nice-to-have
 
 ### Hide vs Close
@@ -95,13 +96,56 @@ These are two distinct operations:
 
 ---
 
+## Visual Design Decisions
+
+### Surface
+- Dark background: ~#0d0f12, find the closest Code OSS dark theme token
+- Subtle top-to-bottom or radial gradient — not flat
+- 14px border radius
+- **Feathered edges via CSS mask** — bubble edges softly fade into the editor. Do not use a hard border as the primary edge treatment. Content should feel like it emerges from the editor surface
+- Layered box-shadow: one tight close-in shadow, one diffuse ambient shadow further out — both dark, not light
+
+### Glow
+- Subtle cyan/blue glow on the bubble border — low opacity, not aggressive, not neon
+- Glow intensifies slightly on hover and during drag
+
+### Slot Dividers
+- Gradient separator between slots: transparent → faint cyan/blue → transparent horizontally
+- Not a hard line
+
+### Configuration Mode (Slot Rearrangement)
+- Triggered by dragging **within** the bubble to rearrange slots — not by dragging the bubble itself
+- A grey glowing background overlay appears inside the bubble revealing drop zones per slot position
+- Drop zones glow softly when a slot is dragged over them
+- Overlay fades out when drag ends
+- Slots snap to grid positions within the bubble
+
+### Typography
+- **UI chrome** (slot labels, controls, timestamps): system sans-serif, small, low contrast against background — present but not loud
+- **Code content** (function names, file paths, symbols): monospace, inheriting the editor font where possible
+- **Slot labels**: uppercase, tracked out, very small — subtle category markers
+
+### Controls
+- Hide (`−`) and Close (`×`) in top right of bubble chrome
+- Very low opacity at rest, full opacity on bubble hover
+- No background on buttons — glyphs only
+
+### What To Never Do Visually
+- Do not use white backgrounds anywhere
+- Do not use hard borders as the primary edge — the mask/feather is the edge
+- Do not make the glow aggressive or neon
+- Do not add animations beyond what is specified
+
+---
+
 ## Slot System
 
 ### Layout
 - 3 slots, vertically stacked by default
 - Default assignment: call graph (top), git/PR history (middle), Slack mentions (bottom)
-- Slots are user-configurable — config persists via `workbench.configuration`
-- These will be more snap to grid slots, providing translucent backgrop configuration options for users to drag and drop
+- Slots are user-configurable via drag-and-drop within the bubble — config persists via `workbench.configuration`
+- Slot rearrangement uses the configuration mode overlay (see above)
+- Each internal slot can be resized within the bounds of the bubble, shifting the others with it if moved
 
 ### Slot State Model
 Each slot independently tracks:
@@ -118,13 +162,26 @@ loading | success | error
 
 ---
 
+## Bubble Focus Mode
+
+- Double-clicking a slot expands it to fill the entire bubble space
+- A back button (`<`) returns to the standard 3-slot view
+- Each slot has distinct capabilities in focus mode (see per-slot details below)
+
+---
+
 ## Data Sources
 
 ### Call Graph (Slot 1)
 - Source: **LSP** (Language Server Protocol)
 - Async round trip — slot will be in loading state initially
 - Query: callers and callees of the highlighted symbol
-- Will come out as a nicely displayed directed node graph
+- Rendered as a directed node graph, visually clean
+- **Focus mode behavior:**
+  - Cmd-click on a node in the call graph collapses the current bubble entirely
+  - Editor auto-scrolls to the clicked function and highlights it
+  - The anchor + "Context Bubble" widget appears on the new function
+  - This creates a new bubble context — see Bubble History State below
 
 ### Git / PR History (Slot 2)
 - Source: **Existing Code OSS git services** — audit what's available before writing anything new
@@ -141,35 +198,14 @@ loading | success | error
 - **This slot may be stubbed initially** — architecture must accommodate it cleanly
 
 ---
-## Bubble Focus
-- When the user double clicks on a certain section of the bubble (e.g. call graph), that section will fill the entire bubble space
-- There will be a back button ("<") to return to the high level bubble, but this gives a focused in view, where each section has certain capabilities, as follows:
 
-### Call Graph (Slot 1)
-- If the user cmd-clicks on one of these functions, the following happens:
-- The bubble and previous highlight collapses entirely
-- The page auto-scrolls up to the function that was clicked, and the function is highlighted with a new context bubble option
-- This also introduces statefulness to actual bubble calls:
+## Bubble History State
 
-### Bubble History State
-- If something like the scenario described in the call graph history occurs, a back arrow should appear next to the smaller back arrow
-- It should indicate moving back to the previous context bubble, not the previous view within the bubbble
-- So, if a new function is highlighted and has the ("Context Bubble +") widget, and it's coming from clicking in the call graph, there should now be optionality to quickly snap back to the former bubble state that got us there
-
-### Git / PR History (Slot 2)
-- Source: **Existing Code OSS git services** — audit what's available before writing anything new
-- Local disk read — should be low latency
-- Query: commit history scoped to the function's line range (`git log -L` equivalent)
-- Line-range history preferred over file-level for precision, despite being slower
-
-### Slack Mentions (Slot 3)
-- Source: **Slack Search API** (live, on-demand)
-- Auth required — treat as a configured integration
-- Query: function name as search term against relevant channels
-- Known limitation: noisy for generic function names — acceptable for now
-- A pre-indexed/cached layer is a future improvement, not in scope for Phase 2
-- **This slot may be stubbed initially** — architecture must accommodate it cleanly
-
+- When a call graph cmd-click navigates to a new function, a bubble history stack is maintained
+- A back arrow appears in the new bubble's chrome (distinct from the focus mode back button) indicating a previous bubble context exists
+- Clicking it restores the previous bubble state: symbol, position, slot data, scroll position
+- History is linear — no branching. Each navigation pushes to the stack, back pops it
+- History is session-scoped — does not persist across IDE restarts
 
 ---
 
@@ -188,9 +224,6 @@ loading | success | error
 ---
 
 ## What Is Not Decided Yet
-- Exact hotkey assignment (pending keybinding registry audit)
-- Whether Slack slot is live or stubbed in Phase 2
-- Specific visual styling / color tokens beyond dark theme compatibility
 - Whether a future VS Code extension extraction changes any of the above
 
 ---
@@ -202,3 +235,6 @@ loading | success | error
 - Do not hardcode slot assignments
 - Do not put bubble logic in the main process or a webview
 - Do not use a state update cycle in the drag `mousemove` hot path
+- Do not use white backgrounds anywhere in the bubble UI
+- Do not make the glow aggressive or neon
+- Do not use hard borders as the primary edge treatment
