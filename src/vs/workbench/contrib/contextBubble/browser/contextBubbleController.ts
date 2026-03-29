@@ -5,6 +5,7 @@
 
 import { Disposable, DisposableStore, MutableDisposable } from '../../../../base/common/lifecycle.js';
 import { CancellationToken, CancellationTokenSource } from '../../../../base/common/cancellation.js';
+import { URI } from '../../../../base/common/uri.js';
 import { mainWindow } from '../../../../base/browser/window.js';
 import { ICodeEditor } from '../../../../editor/browser/editorBrowser.js';
 import { ICodeEditorService } from '../../../../editor/browser/services/codeEditorService.js';
@@ -15,6 +16,7 @@ import { ITextModel } from '../../../../editor/common/model.js';
 import { ILanguageFeaturesService } from '../../../../editor/common/services/languageFeatures.js';
 import { IModelService } from '../../../../editor/common/services/model.js';
 import { IWorkbenchLayoutService } from '../../../services/layout/browser/layoutService.js';
+import { IEditorService } from '../../../services/editor/common/editorService.js';
 import { IConfigurationService, ConfigurationTarget } from '../../../../platform/configuration/common/configuration.js';
 import { CommandsRegistry } from '../../../../platform/commands/common/commands.js';
 import { CallHierarchyModel } from '../../callHierarchy/common/callHierarchy.js';
@@ -281,19 +283,50 @@ function _findEnclosingFunction(model: ITextModel, callLine: number): string | u
 	return undefined;
 }
 
+/**
+ * Scans `model` line-by-line for a declaration of `name`. Prioritises
+ * `function name(` over bare `name(` so call sites are not mistaken for
+ * declarations. Returns the 1-based line number, or `undefined` if not found.
+ */
+function _findDeclarationLine(model: ITextModel, name: string): number | undefined {
+	const safe = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+	// Named function / async function declaration
+	const namedFnRe = new RegExp(`\\bfunction\\s+${safe}\\b`);
+	// Arrow / const assignment: `const name =` or `name =`
+	const assignRe = new RegExp(`\\b${safe}\\s*=`);
+	// Method shorthand in a class body: `name(` on a line that opens a block
+	const methodRe = new RegExp(`\\b${safe}\\s*\\(`);
+
+	let methodFallback: number | undefined;
+
+	for (let ln = 1; ln <= model.getLineCount(); ln++) {
+		const text = model.getLineContent(ln);
+		if (namedFnRe.test(text)) {
+			return ln;
+		}
+		if (assignRe.test(text)) {
+			return ln;
+		}
+		if (methodFallback === undefined && methodRe.test(text) && text.includes('{')) {
+			methodFallback = ln;
+		}
+	}
+	return methodFallback;
+}
+
 // ---------------------------------------------------------------------------
 // Reference-based call graph helpers (fallback when CallHierarchyProvider absent)
 // ---------------------------------------------------------------------------
 
 /**
- * Walks a DocumentSymbol tree to find the name of the deepest function/method/
- * constructor whose range contains `refRange`. Used to convert raw reference
- * locations into caller function names.
+ * Walks a DocumentSymbol tree to find the deepest function/method/constructor
+ * whose range contains `refRange`. Returns the full symbol so callers can use
+ * both the name and the selectionRange for navigation.
  */
-function _findContainingFunctionName(symbols: DocumentSymbol[], refRange: IRange): string | undefined {
+function _findContainingFunction(symbols: DocumentSymbol[], refRange: IRange): DocumentSymbol | undefined {
 	for (const sym of symbols) {
 		if (_rangeContains(sym.range, refRange)) {
-			const fromChild = _findContainingFunctionName(sym.children ?? [], refRange);
+			const fromChild = _findContainingFunction(sym.children ?? [], refRange);
 			if (fromChild !== undefined) {
 				return fromChild;
 			}
@@ -302,7 +335,7 @@ function _findContainingFunctionName(symbols: DocumentSymbol[], refRange: IRange
 				sym.kind === SymbolKind.Method ||
 				sym.kind === SymbolKind.Constructor
 			) {
-				return sym.name;
+				return sym;
 			}
 		}
 	}
@@ -379,6 +412,12 @@ export class ContextBubbleController extends Disposable {
 	private _currentPosition: IPosition | null = null;
 
 	/**
+	 * Symbol → location map built when call graph data is fetched.
+	 * Used to navigate to a node when the user cmd-clicks it.
+	 */
+	private readonly _callNodeLocations = new Map<string, { uri: URI; selectionRange: IRange }>();
+
+	/**
 	 * All three slot instances keyed by source ID.
 	 * Preserved across layout rearrangements so data is not re-fetched.
 	 */
@@ -390,6 +429,7 @@ export class ContextBubbleController extends Disposable {
 		@IConfigurationService private readonly _configurationService: IConfigurationService,
 		@ILanguageFeaturesService private readonly _languageFeaturesService: ILanguageFeaturesService,
 		@IModelService private readonly _modelService: IModelService,
+		@IEditorService private readonly _editorService: IEditorService,
 	) {
 		super();
 		this._register(CommandsRegistry.registerCommand(CONTEXT_BUBBLE_COMMAND_ID, () => {
@@ -503,6 +543,15 @@ export class ContextBubbleController extends Disposable {
 		// Position slots according to saved config
 		this._applyLayout(bubble, config);
 
+		// Wire cmd-click navigation from the call graph slot
+		this._callNodeLocations.clear();
+		const callGraphSlot = this._slotInstances.get('contextBubble.callGraph') as CallGraphSlot | undefined;
+		if (callGraphSlot) {
+			this._sessionDisposables.add(
+				callGraphSlot.onNodeCmdClick(name => this._navigateToNode(name))
+			);
+		}
+
 		// Staggered mock data for git and slack — each slot loads independently.
 		const t1 = setTimeout(() => {
 			this._slotInstances.get('contextBubble.gitHistory')?.renderContent(MOCK_COMMITS);
@@ -556,6 +605,13 @@ export class ContextBubbleController extends Disposable {
 					if (cts.token.isCancellationRequested) {
 						return;
 					}
+					// Store precise locations for cmd-click navigation
+					for (const c of incoming) {
+						this._callNodeLocations.set(c.from.name, { uri: c.from.uri, selectionRange: c.from.selectionRange });
+					}
+					for (const c of outgoing) {
+						this._callNodeLocations.set(c.to.name, { uri: c.to.uri, selectionRange: c.to.selectionRange });
+					}
 					slot.renderContent({
 						callers: incoming.map(c => c.from.name),
 						callees: outgoing.map(c => c.to.name),
@@ -583,7 +639,33 @@ export class ContextBubbleController extends Disposable {
 			// as long as the symbol name was resolved correctly.
 			const symbolName = this._currentSymbolName;
 			if (symbolName && symbolName !== 'symbol') {
-				slot.renderContent(_fetchCallGraphViaText(model, symbolName, position.lineNumber));
+				const result = _fetchCallGraphViaText(model, symbolName, position.lineNumber);
+				slot.renderContent(result);
+				// Populate location cache so cmd-click can navigate
+				for (const callerName of result.callers) {
+					if (!this._callNodeLocations.has(callerName)) {
+						const ln = _findDeclarationLine(model, callerName);
+						if (ln !== undefined) {
+							const col = model.getLineContent(ln).indexOf(callerName) + 1;
+							this._callNodeLocations.set(callerName, {
+								uri: model.uri,
+								selectionRange: { startLineNumber: ln, startColumn: col, endLineNumber: ln, endColumn: col + callerName.length },
+							});
+						}
+					}
+				}
+				for (const calleeName of result.callees) {
+					if (!this._callNodeLocations.has(calleeName)) {
+						const ln = _findDeclarationLine(model, calleeName);
+						if (ln !== undefined) {
+							const col = model.getLineContent(ln).indexOf(calleeName) + 1;
+							this._callNodeLocations.set(calleeName, {
+								uri: model.uri,
+								selectionRange: { startLineNumber: ln, startColumn: col, endLineNumber: ln, endColumn: col + calleeName.length },
+							});
+						}
+					}
+				}
 			} else {
 				slot.renderContent({ callers: [], callees: [] });
 			}
@@ -646,9 +728,14 @@ export class ContextBubbleController extends Disposable {
 					const symbols = await symProvider.provideDocumentSymbols(fileModel, token) ?? [];
 					if (!token.isCancellationRequested) {
 						for (const range of ranges) {
-							const name = _findContainingFunctionName(symbols, range);
-							if (name) {
-								callerNames.add(name);
+							const sym = _findContainingFunction(symbols, range);
+							if (sym) {
+								callerNames.add(sym.name);
+								// Store location for cmd-click navigation
+								this._callNodeLocations.set(sym.name, {
+									uri: fileModel.uri,
+									selectionRange: sym.selectionRange,
+								});
 							}
 						}
 					}
@@ -843,6 +930,7 @@ export class ContextBubbleController extends Disposable {
 	private _teardownSession(): void {
 		this._sessionDisposables.clear();
 		this._slotInstances.clear();
+		this._callNodeLocations.clear();
 		this._anchoredEditor = undefined;
 		this._currentSymbolName = '';
 		this._currentModel = null;
@@ -850,6 +938,30 @@ export class ContextBubbleController extends Disposable {
 		this._anchorSlot.value = undefined;
 		this._arrowSlot.value = undefined;
 		this._bubbleSlot.value = undefined;
+	}
+
+	private _navigateToNode(name: string): void {
+		const loc = this._callNodeLocations.get(name);
+		if (loc) {
+			this._editorService.openEditor({
+				resource: loc.uri,
+				options: { selection: loc.selectionRange, revealIfOpened: true },
+			});
+			return;
+		}
+		// Location not yet cached — scan current file for the function declaration
+		const model = this._currentModel;
+		const editor = this._anchoredEditor;
+		if (!model || !editor) {
+			return;
+		}
+		const ln = _findDeclarationLine(model, name);
+		if (ln === undefined) {
+			return;
+		}
+		const col = model.getLineContent(ln).indexOf(name) + 1;
+		editor.revealLineInCenter(ln);
+		editor.setPosition({ lineNumber: ln, column: Math.max(1, col) });
 	}
 
 	// -------------------------------------------------------------------------

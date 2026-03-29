@@ -3,6 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+import { Emitter } from '../../../../base/common/event.js';
 import { SlotComponent } from './slotComponent.js';
 import { mainWindow } from '../../../../base/browser/window.js';
 
@@ -117,6 +118,10 @@ function truncate(name: string, maxLen: number): string {
  * Cmd-click on any node is stubbed here — navigation is wired in session 5.
  */
 export class CallGraphSlot extends SlotComponent {
+
+	private readonly _cmdClickEmitter = this._register(new Emitter<string>());
+	/** Fired when the user cmd-clicks a node. Payload is the symbol name. */
+	readonly onNodeCmdClick = this._cmdClickEmitter.event;
 
 	private readonly _symbolName: string;
 
@@ -266,11 +271,7 @@ export class CallGraphSlot extends SlotComponent {
 		parent.appendChild(g);
 	}
 
-	/**
-	 * Stub — session 5 will collapse the current bubble, scroll the editor to
-	 * the clicked function, and push the current context onto the bubble history stack.
-	 */
-	private _onNodeCmdClick(_nodeName: string): void {
-		// No-op until session 5
+	private _onNodeCmdClick(nodeName: string): void {
+		this._cmdClickEmitter.fire(nodeName);
 	}
 }
