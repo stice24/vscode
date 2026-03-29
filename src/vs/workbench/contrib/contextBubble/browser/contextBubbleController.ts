@@ -12,6 +12,9 @@ import { CommandsRegistry } from '../../../../platform/commands/common/commands.
 import { ContextBubbleWidget } from './contextBubbleWidget.js';
 import { ContextBubbleAnchor } from './contextBubbleAnchor.js';
 import { ContextBubbleArrow } from './contextBubbleArrow.js';
+import { CallGraphSlot, MOCK_CALL_GRAPH_CALLERS, MOCK_CALL_GRAPH_CALLEES } from './callGraphSlot.js';
+import { GitHistorySlot, MOCK_COMMITS } from './gitHistorySlot.js';
+import { SlackMentionsSlot, buildMockSlackMessages } from './slackMentionsSlot.js';
 
 export const CONTEXT_BUBBLE_COMMAND_ID = 'contextBubble.trigger';
 
@@ -38,7 +41,7 @@ export class ContextBubbleController extends Disposable {
 	private readonly _arrowSlot = this._register(new MutableDisposable<ContextBubbleArrow>());
 
 	/**
-	 * Subscriptions scoped to the current session (anchor + bubble + arrow).
+	 * Subscriptions scoped to the current session (anchor + bubble + arrow + slots).
 	 * Cleared entirely on teardown so nothing outlives the session.
 	 */
 	private readonly _sessionDisposables = this._register(new DisposableStore());
@@ -48,6 +51,12 @@ export class ContextBubbleController extends Disposable {
 	 * Stored so scroll events can be wired without re-capturing the editor context.
 	 */
 	private _anchoredEditor: ICodeEditor | undefined;
+
+	/**
+	 * Symbol name captured at trigger time — used as the centre node in the
+	 * call graph and as the search term for Slack mentions.
+	 */
+	private _currentSymbolName = '';
 
 	constructor(
 		@IWorkbenchLayoutService private readonly _layoutService: IWorkbenchLayoutService,
@@ -83,6 +92,8 @@ export class ContextBubbleController extends Disposable {
 			return;
 		}
 
+		this._currentSymbolName = editorContext.symbolName;
+
 		const anchor = new ContextBubbleAnchor(editorContext.editor, editorContext.lineNumber);
 		this._anchorSlot.value = anchor;
 		this._anchoredEditor = editorContext.editor;
@@ -109,7 +120,7 @@ export class ContextBubbleController extends Disposable {
 
 		const existingBubble = this._bubbleSlot.value;
 		if (existingBubble) {
-			// Re-show the hidden bubble at its last dragged position
+			// Re-show the hidden bubble at its last dragged position — slots intact
 			this._updateArrow();
 			existingBubble.show();
 			return;
@@ -122,6 +133,9 @@ export class ContextBubbleController extends Disposable {
 		const openPos = this._resolveOpenSpacePosition(container);
 		bubble.setPosition(openPos.x, openPos.y);
 
+		// Instantiate the three slot components and attach them to the bubble
+		this._createSlots(bubble);
+
 		// Draw the initial arrow
 		this._updateArrow();
 
@@ -132,6 +146,44 @@ export class ContextBubbleController extends Disposable {
 		this._sessionDisposables.add(bubble.onDidClose(() => this._teardownSession()));
 
 		bubble.show();
+	}
+
+	// -------------------------------------------------------------------------
+	// Slot creation and mock data loading
+	// -------------------------------------------------------------------------
+
+	private _createSlots(bubble: ContextBubbleWidget): void {
+		const container = bubble.getSlotsContainer();
+		const symbolName = this._currentSymbolName;
+
+		const callGraph = new CallGraphSlot(container, symbolName);
+		const gitHistory = new GitHistorySlot(container);
+		const slackMentions = new SlackMentionsSlot(container);
+
+		// Slots are disposed when the session ends
+		this._sessionDisposables.add(callGraph);
+		this._sessionDisposables.add(gitHistory);
+		this._sessionDisposables.add(slackMentions);
+
+		// Staggered mock data delivery — each slot loads independently.
+		// Replace setTimeout bodies with real service calls in later sessions.
+		// Git history arrives first (fastest — local disk read analogue)
+		const t1 = setTimeout(() => {
+			gitHistory.renderContent(MOCK_COMMITS);
+		}, 380);
+
+		// Call graph arrives second (LSP round-trip analogue)
+		const t2 = setTimeout(() => {
+			callGraph.renderContent({ callers: MOCK_CALL_GRAPH_CALLERS, callees: MOCK_CALL_GRAPH_CALLEES });
+		}, 720);
+
+		// Slack arrives last (network API analogue)
+		const t3 = setTimeout(() => {
+			slackMentions.renderContent(buildMockSlackMessages(symbolName));
+		}, 1100);
+
+		// Cancel pending timeouts if the session is torn down before they fire
+		this._sessionDisposables.add({ dispose: () => { clearTimeout(t1); clearTimeout(t2); clearTimeout(t3); } });
 	}
 
 	// -------------------------------------------------------------------------
@@ -229,12 +281,13 @@ export class ContextBubbleController extends Disposable {
 	}
 
 	// -------------------------------------------------------------------------
-	// Session teardown (only caled on x)
+	// Session teardown (only called on ×)
 	// -------------------------------------------------------------------------
 
 	private _teardownSession(): void {
 		this._sessionDisposables.clear();
 		this._anchoredEditor = undefined;
+		this._currentSymbolName = '';
 		this._anchorSlot.value = undefined;
 		this._arrowSlot.value = undefined;
 		this._bubbleSlot.value = undefined;
@@ -247,6 +300,7 @@ export class ContextBubbleController extends Disposable {
 	private _resolveEditorContext(): {
 		editor: ICodeEditor;
 		lineNumber: number;
+		symbolName: string;
 	} | undefined {
 		const editor = this._codeEditorService.getFocusedCodeEditor()
 			?? this._codeEditorService.getActiveCodeEditor();
@@ -259,9 +313,26 @@ export class ContextBubbleController extends Disposable {
 			return undefined;
 		}
 
+		// Capture the symbol name: prefer an active selection, fall back to the
+		// word under the cursor so mock data always references a real identifier.
+		const model = editor.getModel();
+		let symbolName = 'symbol';
+		if (model) {
+			const selectedText = model.getValueInRange(selection).trim();
+			if (selectedText.length > 0) {
+				symbolName = selectedText;
+			} else {
+				const word = model.getWordAtPosition(selection.getStartPosition());
+				if (word) {
+					symbolName = word.word;
+				}
+			}
+		}
+
 		return {
 			editor,
 			lineNumber: selection.selectionStartLineNumber,
+			symbolName,
 		};
 	}
 
