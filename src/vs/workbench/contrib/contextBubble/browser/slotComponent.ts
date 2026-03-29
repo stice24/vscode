@@ -9,6 +9,60 @@ import { mainWindow } from '../../../../base/browser/window.js';
 export type SlotState = 'loading' | 'success' | 'error';
 
 // ---------------------------------------------------------------------------
+// Slot configuration types — shared by widget, overlay, and controller
+// ---------------------------------------------------------------------------
+
+/** Stable identifier for a data source assignable to a slot position. */
+export type SlotSourceId =
+	| 'contextBubble.callGraph'
+	| 'contextBubble.gitHistory'
+	| 'contextBubble.slackMentions';
+
+/** Stable key for a named slot position within the bubble. */
+export type SlotPositionKey = 'slot.top' | 'slot.middle' | 'slot.bottom';
+
+/** Layout preset controlling how the three positions are arranged visually. */
+export type LayoutPresetId =
+	| 'vertical3'    // 3 equal slots stacked vertically (default)
+	| 'largeBottom'  // 2 small top, 1 large bottom
+	| 'largeTop'     // 1 large top, 2 small bottom
+	| 'horizontal3'  // 3 equal slots side by side
+	| 'fullBleed';   // single slot fills the entire bubble
+
+/** Full slot configuration stored in workbench.configuration. */
+export interface ISlotConfig {
+	preset: LayoutPresetId;
+	assignments: Partial<Record<SlotPositionKey, SlotSourceId>>;
+}
+
+/** Ordered list of all position keys. */
+export const SLOT_POSITION_KEYS: SlotPositionKey[] = ['slot.top', 'slot.middle', 'slot.bottom'];
+
+/** All registered source IDs. */
+export const ALL_SOURCE_IDS: SlotSourceId[] = [
+	'contextBubble.callGraph',
+	'contextBubble.gitHistory',
+	'contextBubble.slackMentions',
+];
+
+/** Human-readable display labels for each source. */
+export const SOURCE_LABELS: Record<SlotSourceId, string> = {
+	'contextBubble.callGraph': 'Call Graph',
+	'contextBubble.gitHistory': 'Git History',
+	'contextBubble.slackMentions': 'Slack Mentions',
+};
+
+/** Default configuration: 3 stacked vertically, one source per slot. */
+export const DEFAULT_SLOT_CONFIG: ISlotConfig = {
+	preset: 'vertical3',
+	assignments: {
+		'slot.top': 'contextBubble.callGraph',
+		'slot.middle': 'contextBubble.gitHistory',
+		'slot.bottom': 'contextBubble.slackMentions',
+	},
+};
+
+// ---------------------------------------------------------------------------
 // Base styles — injected once per page lifetime
 // ---------------------------------------------------------------------------
 
@@ -92,6 +146,11 @@ export abstract class SlotComponent extends Disposable {
 
 		container.appendChild(this.element);
 		this._applyState();
+	}
+
+	/** Public accessor for the slot's root DOM element — needed for layout re-ordering. */
+	get domElement(): HTMLElement {
+		return this.element;
 	}
 
 	get state(): SlotState {

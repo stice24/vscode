@@ -617,6 +617,10 @@
 		{
 			"name": "vs/workbench/services/request",
 			"project": "vscode-workbench"
+		},
+		{
+			"name": "vs/workbench/contrib/contextBubble",
+			"project": "vscode-workbench"
 		}
 	],
 	"sessions": [

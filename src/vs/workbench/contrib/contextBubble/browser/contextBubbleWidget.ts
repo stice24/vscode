@@ -188,34 +188,49 @@ function ensureWidgetStyles(): void {
 	opacity: 1 !important;
 }
 
-/* ---- Slot configuration overlay ---- */
-.context-bubble-config-overlay {
-	position: absolute;
-	inset: 0;
-	display: none;
-	flex-direction: column;
-	gap: 4px;
-	padding: 42px 6px 6px;
-	background: rgba(60, 80, 100, 0.07);
-	border-radius: 13px;
-	z-index: 10;
-	pointer-events: none;
-	backdrop-filter: blur(1px);
+/* ---- Preset layout variants on the slots container ---- */
+
+.context-bubble-slots[data-preset="horizontal3"] {
+	flex-direction: row;
 }
-.context-bubble-config-overlay.is-active {
-	display: flex;
-	pointer-events: auto;
+.context-bubble-slots[data-preset="largeBottom"] {
+	display: grid;
+	grid-template-columns: 1fr 1fr;
+	grid-template-rows: 1fr 2fr;
 }
-.context-bubble-drop-zone {
-	flex: 1;
-	border: 1px dashed rgba(80, 200, 220, 0.2);
-	border-radius: 8px;
-	transition: border-color 0.15s, box-shadow 0.15s, background 0.15s;
+.context-bubble-slots[data-preset="largeBottom"] > .context-bubble-slot:nth-child(3) {
+	grid-column: 1 / 3;
+	border-top: 1px solid rgba(80, 200, 220, 0.1);
 }
-.context-bubble-drop-zone.drag-over {
-	border-color: rgba(80, 200, 220, 0.55);
-	background: rgba(80, 200, 220, 0.05);
-	box-shadow: inset 0 0 14px rgba(80, 200, 220, 0.08);
+.context-bubble-slots[data-preset="largeTop"] {
+	display: grid;
+	grid-template-columns: 1fr 1fr;
+	grid-template-rows: 2fr 1fr;
+}
+.context-bubble-slots[data-preset="largeTop"] > .context-bubble-slot:first-child {
+	grid-column: 1 / 3;
+	border-bottom: 1px solid rgba(80, 200, 220, 0.1);
+}
+
+/* ---- Config button in chrome ---- */
+.context-bubble-btn-config {
+	background: none;
+	border: none;
+	cursor: pointer;
+	color: rgba(210, 220, 230, 0.95);
+	font-size: 13px;
+	line-height: 1;
+	padding: 2px 5px;
+	border-radius: 3px;
+	opacity: 0.38;
+	transition: opacity 0.15s, background 0.1s;
+}
+.context-bubble-widget.is-hovered .context-bubble-btn-config {
+	opacity: 0.72;
+}
+.context-bubble-btn-config:hover {
+	opacity: 1 !important;
+	background: rgba(80, 200, 220, 0.12);
 }
 
 `;
@@ -264,13 +279,13 @@ export class ContextBubbleWidget extends Disposable {
 
 	private readonly _element: HTMLElement;
 	private readonly _slotsContainer: HTMLElement;
-	private readonly _configOverlay: HTMLElement;
 	private readonly _resizeHandleElements: HTMLElement[] = [];
 	private readonly _disposables = this._register(new DisposableStore());
 
 	private readonly _onDidMove = this._register(new Emitter<void>());
 	private readonly _onDidClose = this._register(new Emitter<void>());
 	private readonly _onDidInteract = this._register(new Emitter<void>());
+	private readonly _onDidRequestConfig = this._register(new Emitter<void>());
 
 	/** Fires on every `mousemove` during a drag — use to update the arrow. */
 	readonly onDidMove: Event<void> = this._onDidMove.event;
@@ -280,6 +295,9 @@ export class ContextBubbleWidget extends Disposable {
 
 	/** Fires on any `mousedown` on the bubble element. */
 	readonly onDidInteract: Event<void> = this._onDidInteract.event;
+
+	/** Fires when the user clicks the configuration (gear) button. */
+	readonly onDidRequestConfig: Event<void> = this._onDidRequestConfig.event;
 
 	private _x = 100;
 	private _y = 100;
@@ -294,7 +312,6 @@ export class ContextBubbleWidget extends Disposable {
 		super();
 		ensureWidgetStyles();
 		this._slotsContainer = this._buildSlotsContainer();
-		this._configOverlay = this._buildConfigOverlay();
 		this._element = this._buildElement();
 		this._container.appendChild(this._element);
 		this._bindHover();
@@ -357,19 +374,6 @@ export class ContextBubbleWidget extends Disposable {
 		return this._slotsContainer;
 	}
 
-	/**
-	 * Activates the slot-rearrangement configuration overlay.
-	 * Drop zones become interactive and accept slot drag-and-drop.
-	 */
-	enterConfigMode(): void {
-		this._configOverlay.classList.add('is-active');
-	}
-
-	/** Deactivates the configuration overlay. */
-	exitConfigMode(): void {
-		this._configOverlay.classList.remove('is-active');
-	}
-
 	// -------------------------------------------------------------------------
 	// DOM construction
 	// -------------------------------------------------------------------------
@@ -389,7 +393,6 @@ export class ContextBubbleWidget extends Disposable {
 
 		root.appendChild(this._buildChrome());
 		root.appendChild(this._slotsContainer);
-		root.appendChild(this._configOverlay);
 
 		for (const handle of ALL_RESIZE_HANDLES) {
 			const el = this._buildResizeHandle(handle);
@@ -411,6 +414,7 @@ export class ContextBubbleWidget extends Disposable {
 		const controls = document.createElement('span');
 		controls.className = 'context-bubble-controls';
 
+		controls.appendChild(this._buildChromeButton('\u2699', 'context-bubble-btn-config', () => this._onDidRequestConfig.fire()));
 		controls.appendChild(this._buildChromeButton('\u2212', 'context-bubble-btn-hide', () => this.hide()));
 		controls.appendChild(this._buildChromeButton('\u00d7', 'context-bubble-btn-close', () => this.close()));
 
@@ -437,21 +441,6 @@ export class ContextBubbleWidget extends Disposable {
 		const el = document.createElement('div');
 		el.className = 'context-bubble-slots';
 		return el;
-	}
-
-	private _buildConfigOverlay(): HTMLElement {
-		const overlay = document.createElement('div');
-		overlay.className = 'context-bubble-config-overlay';
-
-		// 3 drop zones — one per default slot position
-		for (let i = 0; i < 3; i++) {
-			const zone = document.createElement('div');
-			zone.className = 'context-bubble-drop-zone';
-			zone.dataset['zoneIndex'] = String(i);
-			overlay.appendChild(zone);
-		}
-
-		return overlay;
 	}
 
 	private _buildResizeHandle(handle: ResizeHandle): HTMLElement {

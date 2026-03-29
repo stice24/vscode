@@ -35,23 +35,25 @@ function ensureAnchorStyles(): void {
 .context-bubble-anchor-glyph::before {
 	content: "+";
 	color: #4ec9b0;
-	font-size: 13px;
-	font-weight: 700;
+	font-size: 16px;
+	font-weight: 800;
 	font-family: monospace;
 	line-height: 1;
+	text-shadow: 0 0 8px rgba(78, 201, 176, 0.55);
 }
 .context-bubble-anchor-label::after {
 	content: "Context Bubble";
-	color: rgba(78, 201, 176, 0.38);
+	color: rgba(78, 201, 176, 0.92);
 	font-size: 10px;
 	font-family: system-ui, -apple-system, sans-serif;
-	letter-spacing: 0.05em;
+	letter-spacing: 0.06em;
 	text-transform: uppercase;
 	margin-left: 10px;
-	padding: 1px 7px;
+	padding: 2px 8px;
 	border-radius: 4px;
-	border: 1px solid rgba(78, 201, 176, 0.15);
-	background: rgba(78, 201, 176, 0.04);
+	border: 1px solid rgba(78, 201, 176, 0.42);
+	background: rgba(10, 14, 20, 0.88);
+	box-shadow: 0 1px 5px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(78, 201, 176, 0.08);
 	vertical-align: middle;
 	pointer-events: none;
 }

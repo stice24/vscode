@@ -8,19 +8,38 @@ import { mainWindow } from '../../../../base/browser/window.js';
 import { ICodeEditor } from '../../../../editor/browser/editorBrowser.js';
 import { ICodeEditorService } from '../../../../editor/browser/services/codeEditorService.js';
 import { IWorkbenchLayoutService } from '../../../services/layout/browser/layoutService.js';
+import { IConfigurationService, ConfigurationTarget } from '../../../../platform/configuration/common/configuration.js';
 import { CommandsRegistry } from '../../../../platform/commands/common/commands.js';
 import { ContextBubbleWidget } from './contextBubbleWidget.js';
 import { ContextBubbleAnchor } from './contextBubbleAnchor.js';
 import { ContextBubbleArrow } from './contextBubbleArrow.js';
+import {
+	SlotComponent,
+	ISlotConfig, DEFAULT_SLOT_CONFIG, SlotSourceId, SlotPositionKey,
+	SLOT_POSITION_KEYS,
+} from './slotComponent.js';
 import { CallGraphSlot, MOCK_CALL_GRAPH_CALLERS, MOCK_CALL_GRAPH_CALLEES } from './callGraphSlot.js';
 import { GitHistorySlot, MOCK_COMMITS } from './gitHistorySlot.js';
 import { SlackMentionsSlot, buildMockSlackMessages } from './slackMentionsSlot.js';
+import { SlotConfigOverlay } from './slotConfigOverlay.js';
 
 export const CONTEXT_BUBBLE_COMMAND_ID = 'contextBubble.trigger';
 
 /** Default bubble dimensions — kept in sync with constants in contextBubbleWidget.ts. */
 const DEFAULT_WIDTH = 400;
 const DEFAULT_HEIGHT = 460;
+
+// ---------------------------------------------------------------------------
+// Slot factory map — adding a new data source means adding one entry here
+// ---------------------------------------------------------------------------
+
+type SlotFactory = (container: HTMLElement, symbolName: string) => SlotComponent;
+
+const SLOT_FACTORIES: Record<SlotSourceId, SlotFactory> = {
+	'contextBubble.callGraph': (container, symbolName) => new CallGraphSlot(container, symbolName),
+	'contextBubble.gitHistory': (container, _symbolName) => new GitHistorySlot(container),
+	'contextBubble.slackMentions': (container, _symbolName) => new SlackMentionsSlot(container),
+};
 
 /**
  * Workbench contribution that owns the full context bubble lifecycle.
@@ -58,9 +77,16 @@ export class ContextBubbleController extends Disposable {
 	 */
 	private _currentSymbolName = '';
 
+	/**
+	 * All three slot instances keyed by source ID.
+	 * Preserved across layout rearrangements so data is not re-fetched.
+	 */
+	private readonly _slotInstances = new Map<SlotSourceId, SlotComponent>();
+
 	constructor(
 		@IWorkbenchLayoutService private readonly _layoutService: IWorkbenchLayoutService,
 		@ICodeEditorService private readonly _codeEditorService: ICodeEditorService,
+		@IConfigurationService private readonly _configurationService: IConfigurationService,
 	) {
 		super();
 		this._register(CommandsRegistry.registerCommand(CONTEXT_BUBBLE_COMMAND_ID, () => {
@@ -139,51 +165,138 @@ export class ContextBubbleController extends Disposable {
 		// Draw the initial arrow
 		this._updateArrow();
 
-		// Bubble drag → update arrow path in real time (timer keeps running)
+		// Bubble drag → update arrow path in real time
 		this._sessionDisposables.add(bubble.onDidMove(() => this._updateArrow()));
 
 		// "×" closes bubble AND tears down the full session (including anchor)
 		this._sessionDisposables.add(bubble.onDidClose(() => this._teardownSession()));
 
+		// Gear icon → open slot config overlay
+		this._sessionDisposables.add(bubble.onDidRequestConfig(() => this._openConfigOverlay(bubble)));
+
 		bubble.show();
 	}
 
 	// -------------------------------------------------------------------------
-	// Slot creation and mock data loading
+	// Slot creation
 	// -------------------------------------------------------------------------
 
 	private _createSlots(bubble: ContextBubbleWidget): void {
-		const container = bubble.getSlotsContainer();
 		const symbolName = this._currentSymbolName;
+		const config = this._readSlotConfig();
 
-		const callGraph = new CallGraphSlot(container, symbolName);
-		const gitHistory = new GitHistorySlot(container);
-		const slackMentions = new SlackMentionsSlot(container);
+		// Create all instances using a detached container so they don't appear in
+		// the DOM until _applyLayout() positions them in the correct order.
+		const detached = document.createElement('div');
 
-		// Slots are disposed when the session ends
-		this._sessionDisposables.add(callGraph);
-		this._sessionDisposables.add(gitHistory);
-		this._sessionDisposables.add(slackMentions);
+		for (const sourceId of Object.keys(SLOT_FACTORIES) as SlotSourceId[]) {
+			const slot = SLOT_FACTORIES[sourceId](detached, symbolName);
+			this._slotInstances.set(sourceId, slot);
+			this._sessionDisposables.add(slot);
+		}
 
-		// Staggered mock data delivery — each slot loads independently.
-		// Replace setTimeout bodies with real service calls in later sessions.
-		// Git history arrives first (fastest — local disk read analogue)
+		// Position slots according to saved config
+		this._applyLayout(bubble, config);
+
+		// Staggered mock data — each slot loads independently.
+		// Replace these bodies with real service calls in later sessions.
 		const t1 = setTimeout(() => {
-			gitHistory.renderContent(MOCK_COMMITS);
+			this._slotInstances.get('contextBubble.gitHistory')?.renderContent(MOCK_COMMITS);
 		}, 380);
 
-		// Call graph arrives second (LSP round-trip analogue)
 		const t2 = setTimeout(() => {
-			callGraph.renderContent({ callers: MOCK_CALL_GRAPH_CALLERS, callees: MOCK_CALL_GRAPH_CALLEES });
+			this._slotInstances.get('contextBubble.callGraph')?.renderContent({
+				callers: MOCK_CALL_GRAPH_CALLERS,
+				callees: MOCK_CALL_GRAPH_CALLEES,
+			});
 		}, 720);
 
-		// Slack arrives last (network API analogue)
 		const t3 = setTimeout(() => {
-			slackMentions.renderContent(buildMockSlackMessages(symbolName));
+			this._slotInstances.get('contextBubble.slackMentions')?.renderContent(
+				buildMockSlackMessages(symbolName)
+			);
 		}, 1100);
 
 		// Cancel pending timeouts if the session is torn down before they fire
-		this._sessionDisposables.add({ dispose: () => { clearTimeout(t1); clearTimeout(t2); clearTimeout(t3); } });
+		this._sessionDisposables.add({
+			dispose: () => { clearTimeout(t1); clearTimeout(t2); clearTimeout(t3); },
+		});
+	}
+
+	// -------------------------------------------------------------------------
+	// Layout application
+	// -------------------------------------------------------------------------
+
+	/**
+	 * Re-orders slot DOM elements inside the bubble's slots container according
+	 * to the given config. Slot instances are preserved — data is not re-fetched.
+	 */
+	private _applyLayout(bubble: ContextBubbleWidget, config: ISlotConfig): void {
+		const container = bubble.getSlotsContainer();
+
+		// Remove existing children without disposing — just detaching for re-ordering
+		while (container.firstChild) {
+			container.removeChild(container.firstChild);
+		}
+
+		// Apply preset identifier so CSS grid/flex rules activate
+		container.dataset['preset'] = config.preset;
+
+		// fullBleed only exposes slot.top
+		const positions: SlotPositionKey[] = config.preset === 'fullBleed'
+			? ['slot.top']
+			: SLOT_POSITION_KEYS;
+
+		for (const posKey of positions) {
+			const sourceId = config.assignments[posKey];
+			const slot = sourceId ? this._slotInstances.get(sourceId) : undefined;
+
+			if (slot) {
+				container.appendChild(slot.domElement);
+			} else {
+				// Empty placeholder maintains grid area for unassigned positions
+				const ph = document.createElement('div');
+				ph.className = 'context-bubble-slot';
+				container.appendChild(ph);
+			}
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// Configuration read / write
+	// -------------------------------------------------------------------------
+
+	private _readSlotConfig(): ISlotConfig {
+		const raw = this._configurationService.getValue<ISlotConfig>('contextBubble.slotLayout');
+		if (!raw || typeof raw !== 'object' || !raw.preset || !raw.assignments) {
+			return DEFAULT_SLOT_CONFIG;
+		}
+		return raw;
+	}
+
+	// -------------------------------------------------------------------------
+	// Config overlay
+	// -------------------------------------------------------------------------
+
+	private _openConfigOverlay(bubble: ContextBubbleWidget): void {
+		const currentConfig = this._readSlotConfig();
+		const overlay = new SlotConfigOverlay(bubble.element, currentConfig);
+		this._sessionDisposables.add(overlay);
+
+		this._sessionDisposables.add(overlay.onDidConfirm(choice => {
+			const newConfig: ISlotConfig = {
+				preset: choice.preset,
+				assignments: choice.assignments,
+			};
+			// Persist immediately — fire-and-forget; fallback to defaults on failure
+			this._configurationService.updateValue(
+				'contextBubble.slotLayout', newConfig, ConfigurationTarget.USER
+			).then(undefined, () => { /* ignore write errors */ });
+
+			// Re-order existing slot DOM without re-fetching data
+			this._applyLayout(bubble, newConfig);
+		}));
+		// onDidCancel: overlay disposes itself, no other action needed
 	}
 
 	// -------------------------------------------------------------------------
@@ -286,6 +399,7 @@ export class ContextBubbleController extends Disposable {
 
 	private _teardownSession(): void {
 		this._sessionDisposables.clear();
+		this._slotInstances.clear();
 		this._anchoredEditor = undefined;
 		this._currentSymbolName = '';
 		this._anchorSlot.value = undefined;
