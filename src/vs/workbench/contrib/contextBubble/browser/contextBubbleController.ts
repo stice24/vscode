@@ -17,6 +17,7 @@ import { ILanguageFeaturesService } from '../../../../editor/common/services/lan
 import { IModelService } from '../../../../editor/common/services/model.js';
 import { IWorkbenchLayoutService } from '../../../services/layout/browser/layoutService.js';
 import { IEditorService } from '../../../services/editor/common/editorService.js';
+import { ISCMService } from '../../scm/common/scm.js';
 import { IConfigurationService, ConfigurationTarget } from '../../../../platform/configuration/common/configuration.js';
 import { CommandsRegistry } from '../../../../platform/commands/common/commands.js';
 import { CallHierarchyModel } from '../../callHierarchy/common/callHierarchy.js';
@@ -29,7 +30,7 @@ import {
 	SLOT_POSITION_KEYS,
 } from './slotComponent.js';
 import { CallGraphSlot } from './callGraphSlot.js';
-import { GitHistorySlot, MOCK_COMMITS } from './gitHistorySlot.js';
+import { GitHistorySlot, CommitEntry } from './gitHistorySlot.js';
 import { SlackMentionsSlot, buildMockSlackMessages } from './slackMentionsSlot.js';
 import { SlotConfigOverlay } from './slotConfigOverlay.js';
 
@@ -342,6 +343,21 @@ function _findContainingFunction(symbols: DocumentSymbol[], refRange: IRange): D
 	return undefined;
 }
 
+function _formatRelativeTime(timestampMs: number | undefined): string {
+	if (timestampMs === undefined) { return ''; }
+	const diffSec = Math.floor((Date.now() - timestampMs) / 1000);
+	if (diffSec < 60) { return 'just now'; }
+	const diffMin = Math.floor(diffSec / 60);
+	if (diffMin < 60) { return `${diffMin}m ago`; }
+	const diffHr = Math.floor(diffMin / 60);
+	if (diffHr < 24) { return `${diffHr}h ago`; }
+	const diffDay = Math.floor(diffHr / 24);
+	if (diffDay < 7) { return `${diffDay}d ago`; }
+	const diffWk = Math.floor(diffDay / 7);
+	if (diffWk < 52) { return `${diffWk}w ago`; }
+	return `${Math.floor(diffWk / 52)}y ago`;
+}
+
 function _rangeContains(outer: IRange, inner: IRange): boolean {
 	if (inner.startLineNumber < outer.startLineNumber || inner.endLineNumber > outer.endLineNumber) {
 		return false;
@@ -430,6 +446,7 @@ export class ContextBubbleController extends Disposable {
 		@ILanguageFeaturesService private readonly _languageFeaturesService: ILanguageFeaturesService,
 		@IModelService private readonly _modelService: IModelService,
 		@IEditorService private readonly _editorService: IEditorService,
+		@ISCMService private readonly _scmService: ISCMService,
 	) {
 		super();
 		this._register(CommandsRegistry.registerCommand(CONTEXT_BUBBLE_COMMAND_ID, () => {
@@ -552,21 +569,16 @@ export class ContextBubbleController extends Disposable {
 			);
 		}
 
-		// Staggered mock data for git and slack — each slot loads independently.
-		const t1 = setTimeout(() => {
-			this._slotInstances.get('contextBubble.gitHistory')?.renderContent(MOCK_COMMITS);
-		}, 380);
+		// Git history — real SCM data
+		this._fetchGitHistory();
 
+		// Slack mock — loads independently
 		const t3 = setTimeout(() => {
 			this._slotInstances.get('contextBubble.slackMentions')?.renderContent(
 				buildMockSlackMessages(symbolName)
 			);
 		}, 1100);
-
-		// Cancel pending timeouts if the session is torn down before they fire
-		this._sessionDisposables.add({
-			dispose: () => { clearTimeout(t1); clearTimeout(t3); },
-		});
+		this._sessionDisposables.add({ dispose: () => clearTimeout(t3) });
 
 		// Call graph — real LSP data via CallHierarchyModel
 		this._fetchCallGraph();
@@ -669,6 +681,80 @@ export class ContextBubbleController extends Disposable {
 			} else {
 				slot.renderContent({ callers: [], callees: [] });
 			}
+		};
+
+		doFetch().catch(() => {
+			if (!cts.token.isCancellationRequested) {
+				slot.setState('error');
+			}
+		});
+	}
+
+	// -------------------------------------------------------------------------
+	// Git history — SCM fetch
+	// -------------------------------------------------------------------------
+
+	private _fetchGitHistory(): void {
+		const slot = this._slotInstances.get('contextBubble.gitHistory') as GitHistorySlot | undefined;
+		const model = this._currentModel;
+		if (!slot || !model) {
+			slot?.setState('error');
+			return;
+		}
+
+		const fileUri = model.uri;
+		const repository = this._scmService.getRepository(fileUri);
+		if (!repository) {
+			slot.renderContent([]);
+			return;
+		}
+
+		const historyProvider = repository.provider.historyProvider.get();
+		if (!historyProvider) {
+			slot.renderContent([]);
+			return;
+		}
+
+		const cts = new CancellationTokenSource();
+		this._sessionDisposables.add({ dispose: () => cts.dispose(true) });
+
+		const doFetch = async () => {
+			// Resolve the current HEAD ref so the provider knows which branch to query
+			const currentRef = historyProvider.historyItemRef.get();
+			const historyItemRefs = currentRef ? [currentRef.id] : undefined;
+
+			// Pass 1: fetch up to 30 recent commits on this branch
+			const items = await historyProvider.provideHistoryItems({ limit: 30, historyItemRefs }, cts.token);
+			if (cts.token.isCancellationRequested) { return; }
+			if (!items || items.length === 0) { slot.renderContent([]); return; }
+
+			const fileFsPath = fileUri.fsPath;
+			const relevant: CommitEntry[] = [];
+
+			// Pass 2: filter to commits that touched this file
+			// Note: change URIs include a ?ref=<hash> query string, so compare fsPath not toString()
+			for (const item of items) {
+				if (cts.token.isCancellationRequested) { return; }
+				if (relevant.length >= 10) { break; }
+
+				const parentId = item.parentIds.length > 0 ? item.parentIds[0] : undefined;
+				const changes = await historyProvider.provideHistoryItemChanges(
+					item.id, parentId, cts.token
+				);
+				if (cts.token.isCancellationRequested) { return; }
+
+				const touchesFile = changes?.some(c => c.uri.fsPath === fileFsPath) ?? false;
+				if (touchesFile) {
+					relevant.push({
+						hash: item.displayId ?? item.id.slice(0, 7),
+						author: item.author ?? '',
+						relativeTime: _formatRelativeTime(item.timestamp),
+						message: item.subject,
+					});
+				}
+			}
+
+			slot.renderContent(relevant);
 		};
 
 		doFetch().catch(() => {
