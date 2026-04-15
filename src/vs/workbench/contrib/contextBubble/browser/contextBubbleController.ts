@@ -39,6 +39,7 @@ import { IQuickInputService, IQuickPickItem } from '../../../../platform/quickin
 import { IOpenerService } from '../../../../platform/opener/common/opener.js';
 import { INativeHostService } from '../../../../platform/native/common/native.js';
 import { INotificationService, Severity } from '../../../../platform/notification/common/notification.js';
+import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js';
 
 export const CONTEXT_BUBBLE_COMMAND_ID = 'contextBubble.trigger';
 
@@ -468,6 +469,7 @@ export class ContextBubbleController extends Disposable {
 		@IQuickInputService private readonly _quickInputService: IQuickInputService,
 		@IOpenerService private readonly _openerService: IOpenerService,
 		@INotificationService private readonly _notificationService: INotificationService,
+		@IWorkspaceContextService private readonly _workspaceContextService: IWorkspaceContextService,
 	) {
 		super();
 		this._register(CommandsRegistry.registerCommand(CONTEXT_BUBBLE_COMMAND_ID, () => {
@@ -650,16 +652,32 @@ export class ContextBubbleController extends Disposable {
 					if (cts.token.isCancellationRequested) {
 						return;
 					}
+
+					// Filter out-edges to project-local functions only.
+					// Callees whose uri does not fall under a workspace folder
+					// (e.g. node_modules, stdlib .d.ts files) are excluded.
+					const workspaceFolders = this._workspaceContextService.getWorkspace().folders;
+					const localOutgoing = workspaceFolders.length > 0
+						? outgoing.filter(c => {
+							const uriStr = c.to.uri.toString();
+							return workspaceFolders.some(f => {
+								const root = f.uri.toString();
+								const rootWithSlash = root.endsWith('/') ? root : root + '/';
+								return uriStr.startsWith(rootWithSlash) || uriStr === root;
+							});
+						})
+						: outgoing;
+
 					// Store precise locations for cmd-click navigation
 					for (const c of incoming) {
 						this._callNodeLocations.set(c.from.name, { uri: c.from.uri, selectionRange: c.from.selectionRange });
 					}
-					for (const c of outgoing) {
+					for (const c of localOutgoing) {
 						this._callNodeLocations.set(c.to.name, { uri: c.to.uri, selectionRange: c.to.selectionRange });
 					}
 					slot.renderContent({
 						callers: incoming.map(c => c.from.name),
-						callees: outgoing.map(c => c.to.name),
+						callees: localOutgoing.map(c => c.to.name),
 					});
 				} finally {
 					hierarchy.dispose();
@@ -1402,27 +1420,65 @@ export class ContextBubbleController extends Disposable {
 	}
 
 	private _navigateToNode(name: string): void {
+		const callGraphSlot = this._slotInstances.get('contextBubble.callGraph') as CallGraphSlot | undefined;
+
+		// Push the current call graph state onto the slot's history stack before
+		// changing any controller state, so the saved entry reflects the current symbol.
+		callGraphSlot?.pushCurrentToHistory();
+
 		const loc = this._callNodeLocations.get(name);
+
+		// Update the centre symbol in the slot immediately so that the next
+		// renderContent() call uses the correct label.
+		this._currentSymbolName = name;
+		callGraphSlot?.updateSymbol(name);
+
+		// Update model / position for the new symbol so _fetchCallGraph can query LSP.
+		if (loc) {
+			const newModel = this._modelService.getModel(loc.uri);
+			if (newModel) {
+				this._currentModel = newModel;
+			}
+			this._currentPosition = {
+				lineNumber: loc.selectionRange.startLineNumber,
+				column: loc.selectionRange.startColumn,
+			};
+		} else {
+			// Fallback — scan the current file for a declaration of the symbol.
+			const model = this._currentModel;
+			if (model) {
+				const ln = _findDeclarationLine(model, name);
+				if (ln !== undefined) {
+					this._currentPosition = {
+						lineNumber: ln,
+						column: Math.max(1, model.getLineContent(ln).indexOf(name) + 1),
+					};
+				}
+			}
+		}
+
+		// Clear the location cache — it belongs to the previous symbol.
+		this._callNodeLocations.clear();
+
+		// Open the editor at the target symbol's location.
 		if (loc) {
 			this._editorService.openEditor({
 				resource: loc.uri,
 				options: { selection: loc.selectionRange, revealIfOpened: true },
 			});
-			return;
+		} else {
+			const model = this._currentModel;
+			const editor = this._anchoredEditor;
+			if (model && editor && this._currentPosition) {
+				editor.revealLineInCenter(this._currentPosition.lineNumber);
+				editor.setPosition(this._currentPosition);
+			}
 		}
-		// Location not yet cached — scan current file for the function declaration
-		const model = this._currentModel;
-		const editor = this._anchoredEditor;
-		if (!model || !editor) {
-			return;
-		}
-		const ln = _findDeclarationLine(model, name);
-		if (ln === undefined) {
-			return;
-		}
-		const col = model.getLineContent(ln).indexOf(name) + 1;
-		editor.revealLineInCenter(ln);
-		editor.setPosition({ lineNumber: ln, column: Math.max(1, col) });
+
+		// Re-trigger the full bubble data load for the new symbol.
+		this._fetchCallGraph();
+		this._fetchGitHistory();
+		this._fetchSlackMentions();
 	}
 
 	// -------------------------------------------------------------------------

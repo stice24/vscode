@@ -155,6 +155,9 @@ function parseMessage(msg: string): { body: string; pr: string | undefined } {
  */
 export class GitHistorySlot extends SlotComponent {
 
+	/** The currently rendered commit list element. Replaced on each renderContent call. */
+	private _listEl: HTMLElement | null = null;
+
 	constructor(container: HTMLElement) {
 		super(container, 'Git History');
 		ensureGitHistoryStyles();
@@ -162,6 +165,8 @@ export class GitHistorySlot extends SlotComponent {
 
 	override renderContent(data: unknown): void {
 		const commits = data as CommitEntry[];
+		this._listEl?.remove();
+		this._listEl = null;
 		this.setState('success');
 		this._renderList(commits);
 	}
@@ -174,6 +179,7 @@ export class GitHistorySlot extends SlotComponent {
 			list.appendChild(this._buildEntry(commit));
 		}
 
+		this._listEl = list;
 		this.element.appendChild(list);
 	}
 

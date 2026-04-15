@@ -47,6 +47,53 @@ function ensureCallGraphStyles(): void {
 	user-select: none;
 }
 
+.call-graph-history-bar {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	padding: 5px 10px;
+	background: rgba(22, 28, 36, 0.98);
+	border-top: 1.5px solid rgba(80, 200, 220, 0.55);
+	flex-shrink: 0;
+	gap: 8px;
+}
+
+.call-graph-history-btn {
+	background: none;
+	border: 1px solid rgba(80, 200, 220, 0.4);
+	cursor: pointer;
+	color: rgba(90, 215, 235, 0.97);
+	font-size: 13px;
+	line-height: 1;
+	padding: 2px 8px;
+	border-radius: 3px;
+	transition: background 0.1s, border-color 0.1s;
+	flex-shrink: 0;
+}
+
+.call-graph-history-btn:disabled {
+	color: rgba(120, 140, 155, 0.4);
+	border-color: rgba(120, 140, 155, 0.2);
+	cursor: default;
+}
+
+.call-graph-history-btn:not(:disabled):hover {
+	background: rgba(80, 200, 220, 0.18);
+	border-color: rgba(80, 200, 220, 0.6);
+}
+
+.call-graph-history-label {
+	font-family: monospace, "Courier New";
+	font-size: 10px;
+	color: rgba(205, 225, 240, 0.97);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	flex: 1;
+	text-align: center;
+	letter-spacing: 0.02em;
+}
+
 `;
 	mainWindow.document.head.appendChild(style);
 }
@@ -61,6 +108,12 @@ export interface CallGraphData {
 	callers: string[];
 	/** Names of functions the centre symbol calls. */
 	callees: string[];
+}
+
+/** One entry in the navigation history stack. */
+interface IHistoryEntry {
+	symbolName: string;
+	data: CallGraphData;
 }
 
 // ---------------------------------------------------------------------------
@@ -115,15 +168,34 @@ function truncate(name: string, maxLen: number): string {
  *
  * Renders a directed node graph: callers branch in from the left, the
  * highlighted symbol sits in the centre, callees branch out to the right.
- * Cmd-click on any node is stubbed here — navigation is wired in session 5.
+ *
+ * Cmd-click on any node navigates the bubble to that symbol and pushes the
+ * current view onto a history stack. A compact history bar appears at the
+ * bottom of the slot when history depth > 0, providing back/forward navigation.
  */
 export class CallGraphSlot extends SlotComponent {
+
+	/** Max nodes shown as individual circles on either side before switching to a list widget. */
+	private static readonly MAX_SIDE_NODES = 4;
 
 	private readonly _cmdClickEmitter = this._register(new Emitter<string>());
 	/** Fired when the user cmd-clicks a node. Payload is the symbol name. */
 	readonly onNodeCmdClick = this._cmdClickEmitter.event;
 
-	private readonly _symbolName: string;
+	private _symbolName: string;
+
+	// ---- History state (local to this slot instance / session) --------------
+
+	private _backStack: IHistoryEntry[] = [];
+	private _forwardStack: IHistoryEntry[] = [];
+	/** The data from the most recent successful renderContent call. */
+	private _lastRenderedData: CallGraphData | null = null;
+	/** The history bar DOM element, present only when backStack.length > 0. */
+	private _historyBarEl: HTMLElement | null = null;
+	/** Direct reference to the rendered SVG element, avoids querySelector. */
+	private _svgEl: SVGSVGElement | null = null;
+	/** Currently visible tooltip element, if any. */
+	private _activeTooltip: SVGGElement | null = null;
 
 	constructor(container: HTMLElement, symbolName: string) {
 		super(container, 'Call Graph');
@@ -131,10 +203,138 @@ export class CallGraphSlot extends SlotComponent {
 		ensureCallGraphStyles();
 	}
 
+	// -------------------------------------------------------------------------
+	// Public API — called by the controller
+	// -------------------------------------------------------------------------
+
+	/**
+	 * Updates the symbol name used as the centre node label.
+	 * Must be called before renderContent() fires for the new symbol so the
+	 * graph renders with the correct label.
+	 */
+	updateSymbol(name: string): void {
+		this._symbolName = name;
+	}
+
+	/**
+	 * Saves the current symbol + graph data onto the back stack and clears the
+	 * forward stack. Called by the controller just before re-fetching for a new
+	 * symbol (i.e. when the user cmd-clicks a node).
+	 *
+	 * No-op if no data has been rendered yet.
+	 */
+	pushCurrentToHistory(): void {
+		if (this._lastRenderedData === null) {
+			return;
+		}
+		this._backStack.push({ symbolName: this._symbolName, data: this._lastRenderedData });
+		this._forwardStack = [];
+		// Bar will be updated by the next renderContent() call.
+	}
+
+	// -------------------------------------------------------------------------
+	// SlotComponent override
+	// -------------------------------------------------------------------------
+
 	override renderContent(data: unknown): void {
 		const { callers, callees } = data as CallGraphData;
+		this._lastRenderedData = { callers, callees };
+
+		// Clear any existing graph before rendering fresh content. This handles
+		// both the initial render and re-navigation renders correctly.
+		this._clearGraph();
+
 		this.setState('success');
 		this._renderGraph(callers, callees);
+		this._updateHistoryBar();
+	}
+
+	// -------------------------------------------------------------------------
+	// Internal graph / history helpers
+	// -------------------------------------------------------------------------
+
+	/** Removes the SVG graph element from the slot DOM and resets tooltip state. */
+	private _clearGraph(): void {
+		this._activeTooltip = null;
+		this._svgEl?.remove();
+		this._svgEl = null;
+	}
+
+	/**
+	 * Rebuilds the history bar based on current stack state.
+	 * Removes any existing bar and re-creates it if history depth > 0.
+	 */
+	private _updateHistoryBar(): void {
+		this._historyBarEl?.remove();
+		this._historyBarEl = null;
+
+		if (this._backStack.length === 0) {
+			return;
+		}
+
+		const bar = document.createElement('div');
+		bar.className = 'call-graph-history-bar';
+
+		const backBtn = document.createElement('button');
+		backBtn.className = 'call-graph-history-btn';
+		backBtn.textContent = '\u2190'; // ←
+		backBtn.disabled = false;
+		backBtn.addEventListener('click', () => this._onBackClicked());
+
+		const label = document.createElement('span');
+		label.className = 'call-graph-history-label';
+		label.textContent = this._symbolName;
+
+		const fwdBtn = document.createElement('button');
+		fwdBtn.className = 'call-graph-history-btn';
+		fwdBtn.textContent = '\u2192'; // →
+		fwdBtn.disabled = this._forwardStack.length === 0;
+		fwdBtn.addEventListener('click', () => this._onForwardClicked());
+
+		bar.appendChild(backBtn);
+		bar.appendChild(label);
+		bar.appendChild(fwdBtn);
+
+		this._historyBarEl = bar;
+		this.element.appendChild(bar);
+	}
+
+	private _onBackClicked(): void {
+		const entry = this._backStack.pop();
+		if (!entry || this._lastRenderedData === null) {
+			return;
+		}
+
+		// Push current state onto the forward stack so the user can go forward again.
+		this._forwardStack.push({ symbolName: this._symbolName, data: this._lastRenderedData });
+
+		// Restore previous state.
+		this._symbolName = entry.symbolName;
+		this._lastRenderedData = entry.data;
+
+		this._clearGraph();
+		this.setState('success');
+		this._renderGraph(entry.data.callers, entry.data.callees);
+		this._updateHistoryBar();
+	}
+
+	private _onForwardClicked(): void {
+		const entry = this._forwardStack.pop();
+		if (!entry || this._lastRenderedData === null) {
+			return;
+		}
+
+		// Push current state onto the back stack.
+		this._backStack.push({ symbolName: this._symbolName, data: this._lastRenderedData });
+
+		// Restore forward state.
+		this._symbolName = entry.symbolName;
+		this._lastRenderedData = entry.data;
+
+		this._clearGraph();
+		this.setState('success');
+		this._renderGraph(entry.data.callers, entry.data.callees);
+		this._updateHistoryBar();
 	}
 
 	// -------------------------------------------------------------------------
@@ -143,7 +343,22 @@ export class CallGraphSlot extends SlotComponent {
 
 	private _renderGraph(callers: string[], callees: string[]): void {
 		const vw = 300;
-		const vh = 108;
+		const centerR = 22;
+		const nodeR = 15;
+		const minSpacing = 32; // px between node centres
+		const minVH = 120;
+		const limit = CallGraphSlot.MAX_SIDE_NODES;
+
+		const useCallerList = callers.length > limit;
+		const useCalleeList = callees.length > limit;
+
+		// vh only needs to accommodate the sides that render individual nodes.
+		const maxDisplayedNodes = Math.max(
+			useCallerList ? 0 : callers.length,
+			useCalleeList ? 0 : callees.length,
+			1
+		);
+		const vh = Math.max(minVH, maxDisplayedNodes * minSpacing + nodeR * 6);
 
 		const svg = document.createElementNS(SVG_NS, 'svg') as SVGSVGElement;
 		svg.setAttribute('viewBox', `0 0 ${vw} ${vh}`);
@@ -161,16 +376,14 @@ export class CallGraphSlot extends SlotComponent {
 		marker.setAttribute('orient', 'auto');
 		const arrowPoly = document.createElementNS(SVG_NS, 'polygon') as SVGPolygonElement;
 		arrowPoly.setAttribute('points', '0 0, 7 2.5, 0 5');
-		arrowPoly.setAttribute('fill', 'rgba(100, 128, 148, 0.55)');
+		arrowPoly.setAttribute('fill', 'rgba(130, 165, 190, 0.82)');
 		marker.appendChild(arrowPoly);
 		defs.appendChild(marker);
 		svg.appendChild(defs);
 
-		const centerR = 18;
-		const nodeR = 11;
 		const center: IPoint = { x: vw / 2, y: vh / 2 };
-		const callerX = 58;
-		const calleeX = vw - 58;
+		const callerX = 50;
+		const calleeX = vw - 50;
 
 		/** Distribute n nodes evenly in the vertical space, centred on vh/2. */
 		const layoutY = (count: number, index: number): number => {
@@ -182,28 +395,62 @@ export class CallGraphSlot extends SlotComponent {
 			return (vh / 2) - (totalSpan / 2) + index * spacing;
 		};
 
-		// Edges drawn first so nodes render on top
+		// Layers — edges first so nodes render on top; tooltip layer always topmost.
 		const edgeLayer = document.createElementNS(SVG_NS, 'g') as SVGGElement;
 		const nodeLayer = document.createElementNS(SVG_NS, 'g') as SVGGElement;
+		const tooltipLayer = document.createElementNS(SVG_NS, 'g') as SVGGElement;
 		svg.appendChild(edgeLayer);
 		svg.appendChild(nodeLayer);
 
-		callers.forEach((name, i) => {
-			const pos: IPoint = { x: callerX, y: layoutY(callers.length, i) };
-			this._appendEdge(edgeLayer, edgePoints(pos, nodeR, center, centerR));
-			this._appendNode(nodeLayer, pos, nodeR, name, false);
-		});
+		// Callers
+		if (useCallerList) {
+			this._appendListNode(edgeLayer, nodeLayer, callers, { x: callerX, y: vh / 2 }, center, centerR, true, vh);
+		} else {
+			callers.forEach((name, i) => {
+				const pos: IPoint = { x: callerX, y: layoutY(callers.length, i) };
+				this._appendEdge(edgeLayer, edgePoints(pos, nodeR, center, centerR));
+				this._appendNode(nodeLayer, tooltipLayer, pos, nodeR, name, false);
+			});
+			if (callers.length === 0) {
+				this._appendEmptyLabel(nodeLayer, callerX, vh / 2, 'no callers');
+			}
+		}
 
-		callees.forEach((name, i) => {
-			const pos: IPoint = { x: calleeX, y: layoutY(callees.length, i) };
-			this._appendEdge(edgeLayer, edgePoints(center, centerR, pos, nodeR));
-			this._appendNode(nodeLayer, pos, nodeR, name, false);
-		});
+		// Callees
+		if (useCalleeList) {
+			this._appendListNode(edgeLayer, nodeLayer, callees, { x: calleeX, y: vh / 2 }, center, centerR, false, vh);
+		} else {
+			callees.forEach((name, i) => {
+				const pos: IPoint = { x: calleeX, y: layoutY(callees.length, i) };
+				this._appendEdge(edgeLayer, edgePoints(center, centerR, pos, nodeR));
+				this._appendNode(nodeLayer, tooltipLayer, pos, nodeR, name, false);
+			});
+			if (callees.length === 0) {
+				this._appendEmptyLabel(nodeLayer, calleeX, vh / 2, 'no project callees');
+			}
+		}
 
 		// Centre node drawn last — sits on top of all edges
-		this._appendNode(nodeLayer, center, centerR, this._symbolName, true);
+		this._appendNode(nodeLayer, tooltipLayer, center, centerR, this._symbolName, true);
 
+		// Tooltip layer is always rendered on top of everything.
+		svg.appendChild(tooltipLayer);
+
+		this._svgEl = svg;
 		this.element.appendChild(svg);
+	}
+
+	private _appendEmptyLabel(parent: SVGGElement, x: number, y: number, text: string): void {
+		const el = document.createElementNS(SVG_NS, 'text') as SVGTextElement;
+		el.setAttribute('x', String(x));
+		el.setAttribute('y', String(y));
+		el.setAttribute('text-anchor', 'middle');
+		el.setAttribute('dominant-baseline', 'middle');
+		el.setAttribute('fill', 'rgba(120, 140, 155, 0.35)');
+		el.setAttribute('font-size', '7');
+		el.setAttribute('font-family', 'system-ui, -apple-system, sans-serif');
+		el.textContent = text;
+		parent.appendChild(el);
 	}
 
 	private _appendEdge(
@@ -215,14 +462,15 @@ export class CallGraphSlot extends SlotComponent {
 		line.setAttribute('y1', String(Math.round(ep.y1 * 10) / 10));
 		line.setAttribute('x2', String(Math.round(ep.x2 * 10) / 10));
 		line.setAttribute('y2', String(Math.round(ep.y2 * 10) / 10));
-		line.setAttribute('stroke', 'rgba(100, 128, 148, 0.38)');
-		line.setAttribute('stroke-width', '1');
+		line.setAttribute('stroke', 'rgba(130, 165, 190, 0.62)');
+		line.setAttribute('stroke-width', '1.1');
 		line.setAttribute('marker-end', 'url(#ctx-cg-arrow)');
 		parent.appendChild(line);
 	}
 
 	private _appendNode(
 		parent: SVGGElement,
+		tooltipLayer: SVGGElement,
 		pos: IPoint,
 		r: number,
 		name: string,
@@ -235,33 +483,36 @@ export class CallGraphSlot extends SlotComponent {
 		circle.setAttribute('cx', String(pos.x));
 		circle.setAttribute('cy', String(pos.y));
 		circle.setAttribute('r', String(r));
-		circle.setAttribute('fill', isCenter ? 'rgba(78, 201, 176, 0.15)' : 'rgba(100, 128, 148, 0.15)');
-		circle.setAttribute('stroke', isCenter ? 'rgba(78, 201, 176, 0.65)' : 'rgba(100, 128, 148, 0.45)');
-		circle.setAttribute('stroke-width', '1');
+		circle.setAttribute('fill', isCenter ? 'rgba(78, 201, 176, 0.18)' : 'rgba(110, 140, 165, 0.22)');
+		circle.setAttribute('stroke', isCenter ? 'rgba(78, 201, 176, 0.88)' : 'rgba(130, 165, 190, 0.72)');
+		circle.setAttribute('stroke-width', isCenter ? '1.8' : '1.4');
 
-		const label = truncate(name, isCenter ? 11 : 9);
+		const label = truncate(name, isCenter ? 12 : 10);
 		const text = document.createElementNS(SVG_NS, 'text') as SVGTextElement;
 		text.setAttribute('x', String(pos.x));
-		text.setAttribute('font-size', '7.5');
+		text.setAttribute('font-size', isCenter ? '9' : '8');
 		text.setAttribute('font-family', 'monospace, "Courier New"');
 		text.setAttribute('text-anchor', 'middle');
 
+		// All labels centred inside their circle
+		text.setAttribute('y', String(pos.y));
+		text.setAttribute('dominant-baseline', 'middle');
 		if (isCenter) {
-			text.setAttribute('y', String(pos.y));
-			text.setAttribute('dominant-baseline', 'middle');
-			text.setAttribute('fill', 'rgba(78, 201, 176, 0.9)');
+			text.setAttribute('fill', 'rgba(78, 201, 176, 0.97)');
 		} else {
-			// Label below circle
-			text.setAttribute('y', String(pos.y + r + 9));
-			text.setAttribute('dominant-baseline', 'auto');
-			text.setAttribute('fill', 'rgba(155, 172, 185, 0.82)');
+			text.setAttribute('fill', 'rgba(195, 215, 230, 0.92)');
 		}
 		text.textContent = label;
 
 		g.appendChild(circle);
 		g.appendChild(text);
 
-		// Cmd-click stub — navigation to this symbol wired in session 5
+		// Hover tooltip — only needed when the name is truncated.
+		if (name !== label) {
+			g.addEventListener('mouseenter', () => this._showTooltip(tooltipLayer, pos, r, name));
+			g.addEventListener('mouseleave', () => this._hideTooltip());
+		}
+
 		g.addEventListener('click', (e: MouseEvent) => {
 			if (e.metaKey) {
 				this._onNodeCmdClick(name);
@@ -269,6 +520,142 @@ export class CallGraphSlot extends SlotComponent {
 		});
 
 		parent.appendChild(g);
+	}
+
+	private _showTooltip(layer: SVGGElement, pos: IPoint, r: number, fullName: string): void {
+		this._hideTooltip();
+
+		const fontSize = 7.5;
+		const padX = 6;
+		const padY = 3.5;
+		const pillH = fontSize + padY * 2;
+		// Rough monospace char width estimate; cap so it stays within the 300px viewBox.
+		const pillW = Math.min(fullName.length * 4.6 + padX * 2, 110);
+		const pillX = Math.max(4, Math.min(pos.x - pillW / 2, 296 - pillW));
+		// Prefer above the node; clamp so it doesn't escape the viewBox top.
+		const pillY = Math.max(3, pos.y - r - pillH - 5);
+
+		const g = document.createElementNS(SVG_NS, 'g') as SVGGElement;
+
+		const rect = document.createElementNS(SVG_NS, 'rect') as SVGRectElement;
+		rect.setAttribute('x', String(pillX));
+		rect.setAttribute('y', String(pillY));
+		rect.setAttribute('width', String(pillW));
+		rect.setAttribute('height', String(pillH));
+		rect.setAttribute('rx', '4');
+		rect.setAttribute('fill', 'rgba(14, 20, 28, 0.97)');
+		rect.setAttribute('stroke', 'rgba(78, 201, 176, 0.55)');
+		rect.setAttribute('stroke-width', '0.8');
+
+		const text = document.createElementNS(SVG_NS, 'text') as SVGTextElement;
+		text.setAttribute('x', String(pillX + pillW / 2));
+		text.setAttribute('y', String(pillY + pillH / 2));
+		text.setAttribute('text-anchor', 'middle');
+		text.setAttribute('dominant-baseline', 'middle');
+		text.setAttribute('fill', 'rgba(210, 230, 245, 0.97)');
+		text.setAttribute('font-size', String(fontSize));
+		text.setAttribute('font-family', 'monospace, "Courier New"');
+		text.textContent = fullName;
+
+		g.appendChild(rect);
+		g.appendChild(text);
+		layer.appendChild(g);
+		this._activeTooltip = g;
+	}
+
+	private _hideTooltip(): void {
+		this._activeTooltip?.remove();
+		this._activeTooltip = null;
+	}
+
+	/**
+	 * Renders a scrollable list widget in place of individual nodes when a side
+	 * has more than MAX_SIDE_NODES entries. Draws an edge from the list rect to
+	 * the centre node using the same arrow style as individual node edges.
+	 */
+	private _appendListNode(
+		edgeLayer: SVGGElement,
+		nodeLayer: SVGGElement,
+		names: string[],
+		listCenter: IPoint,
+		center: IPoint,
+		centerR: number,
+		isCallers: boolean,
+		vh: number
+	): void {
+		const rectW = 72;
+		const rectH = Math.min(84, vh - 16);
+
+		// Edge — treat the rect's half-width as its "radius" so edgePoints lands
+		// on the near face of the rectangle rather than inside it.
+		const ep = isCallers
+			? edgePoints(listCenter, rectW / 2, center, centerR)
+			: edgePoints(center, centerR, listCenter, rectW / 2);
+		this._appendEdge(edgeLayer, ep);
+
+		// Background rect
+		const rx = listCenter.x - rectW / 2;
+		const ry = listCenter.y - rectH / 2;
+
+		const rect = document.createElementNS(SVG_NS, 'rect') as SVGRectElement;
+		rect.setAttribute('x', String(rx));
+		rect.setAttribute('y', String(ry));
+		rect.setAttribute('width', String(rectW));
+		rect.setAttribute('height', String(rectH));
+		rect.setAttribute('rx', '6');
+		rect.setAttribute('fill', 'rgba(110, 140, 165, 0.12)');
+		rect.setAttribute('stroke', 'rgba(130, 165, 190, 0.65)');
+		rect.setAttribute('stroke-width', '1');
+		nodeLayer.appendChild(rect);
+
+		// Count label above the rect
+		const countLabel = document.createElementNS(SVG_NS, 'text') as SVGTextElement;
+		countLabel.setAttribute('x', String(listCenter.x));
+		countLabel.setAttribute('y', String(ry - 4));
+		countLabel.setAttribute('text-anchor', 'middle');
+		countLabel.setAttribute('dominant-baseline', 'auto');
+		countLabel.setAttribute('fill', 'rgba(160, 185, 205, 0.7)');
+		countLabel.setAttribute('font-size', '6');
+		countLabel.setAttribute('font-family', 'system-ui, -apple-system, sans-serif');
+		countLabel.textContent = `${names.length} ${isCallers ? 'callers' : 'callees'}`;
+		nodeLayer.appendChild(countLabel);
+
+		// Scrollable list via foreignObject
+		const fo = document.createElementNS(SVG_NS, 'foreignObject') as SVGForeignObjectElement;
+		fo.setAttribute('x', String(rx + 1));
+		fo.setAttribute('y', String(ry + 1));
+		fo.setAttribute('width', String(rectW - 2));
+		fo.setAttribute('height', String(rectH - 2));
+
+		const container = document.createElementNS('http://www.w3.org/1999/xhtml', 'div') as HTMLDivElement;
+		container.style.cssText = [
+			'width:100%', 'height:100%', 'overflow-y:auto', 'box-sizing:border-box',
+			'padding:3px 0', 'scrollbar-width:thin',
+			'scrollbar-color:rgba(130,165,190,0.35) transparent',
+		].join(';');
+
+		for (const name of names) {
+			const item = document.createElementNS('http://www.w3.org/1999/xhtml', 'div') as HTMLDivElement;
+			item.style.cssText = [
+				'padding:2px 7px', 'font-family:monospace,"Courier New"', 'font-size:6.5px',
+				'color:rgba(200,220,238,0.9)', 'white-space:nowrap', 'overflow:hidden',
+				'text-overflow:ellipsis', 'cursor:pointer', 'border-radius:2px',
+				'transition:background 0.1s',
+			].join(';');
+			item.title = name;
+			item.textContent = name;
+			item.addEventListener('mouseenter', () => { item.style.background = 'rgba(130,165,190,0.18)'; });
+			item.addEventListener('mouseleave', () => { item.style.background = ''; });
+			item.addEventListener('click', (e: MouseEvent) => {
+				if (e.metaKey) {
+					this._onNodeCmdClick(name);
+				}
+			});
+			container.appendChild(item);
+		}
+
+		fo.appendChild(container);
+		nodeLayer.appendChild(fo);
 	}
 
 	private _onNodeCmdClick(nodeName: string): void {
