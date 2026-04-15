@@ -38,6 +38,7 @@ import { IStorageService, StorageScope, StorageTarget } from '../../../../platfo
 import { IQuickInputService, IQuickPickItem } from '../../../../platform/quickinput/common/quickInput.js';
 import { IOpenerService } from '../../../../platform/opener/common/opener.js';
 import { INativeHostService } from '../../../../platform/native/common/native.js';
+import { INotificationService, Severity } from '../../../../platform/notification/common/notification.js';
 
 export const CONTEXT_BUBBLE_COMMAND_ID = 'contextBubble.trigger';
 
@@ -466,10 +467,14 @@ export class ContextBubbleController extends Disposable {
 		@INativeHostService private readonly _nativeHostService: INativeHostService,
 		@IQuickInputService private readonly _quickInputService: IQuickInputService,
 		@IOpenerService private readonly _openerService: IOpenerService,
+		@INotificationService private readonly _notificationService: INotificationService,
 	) {
 		super();
 		this._register(CommandsRegistry.registerCommand(CONTEXT_BUBBLE_COMMAND_ID, () => {
 			this._triggerBubble();
+		}));
+		this._register(CommandsRegistry.registerCommand('contextBubble.testSlackConnection', () => {
+			this._testSlackConnection();
 		}));
 	}
 
@@ -865,6 +870,53 @@ export class ContextBubbleController extends Disposable {
 		}));
 
 		inputBox.show();
+	}
+
+	/**
+	 * Calls `auth.test` with the stored token and surfaces the result as a
+	 * notification — useful for diagnosing token / permission problems without
+	 * needing a bubble open.
+	 */
+	private _testSlackConnection(): void {
+		const token = this._storageService.get('contextBubble.slackToken', StorageScope.APPLICATION);
+		if (!token) {
+			this._notificationService.notify({
+				severity: Severity.Warning,
+				message: nls.localize('slack.test.noToken', 'No Slack token stored. Use "Connect Slack" inside the bubble first.'),
+			});
+			return;
+		}
+
+		const cts = new CancellationTokenSource();
+		this._nativeHostService.fetchUrl(
+			'https://slack.com/api/auth.test',
+			{ 'Authorization': `Bearer ${token}` },
+		).then(({ statusCode, body }) => {
+			cts.dispose();
+			let parsed: { ok: boolean; error?: string; user?: string; team?: string } | undefined;
+			try {
+				parsed = JSON.parse(body);
+			} catch {
+				// fall through — raw body shown below
+			}
+			if (parsed?.ok) {
+				this._notificationService.notify({
+					severity: Severity.Info,
+					message: nls.localize('slack.test.ok', 'Slack token valid — user: {0}, workspace: {1}', parsed.user ?? '?', parsed.team ?? '?'),
+				});
+			} else {
+				this._notificationService.notify({
+					severity: Severity.Error,
+					message: nls.localize('slack.test.fail', 'Slack auth.test failed (HTTP {0}): {1}', String(statusCode), parsed?.error ?? body.slice(0, 200)),
+				});
+			}
+		}, (err: Error) => {
+			cts.dispose();
+			this._notificationService.notify({
+				severity: Severity.Error,
+				message: nls.localize('slack.test.networkError', 'Slack auth.test network error: {0}', err.message),
+			});
+		});
 	}
 
 	/**
