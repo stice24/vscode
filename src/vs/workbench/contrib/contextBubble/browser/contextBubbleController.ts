@@ -31,8 +31,13 @@ import {
 } from './slotComponent.js';
 import { CallGraphSlot } from './callGraphSlot.js';
 import { GitHistorySlot, CommitEntry } from './gitHistorySlot.js';
-import { SlackMentionsSlot, buildMockSlackMessages } from './slackMentionsSlot.js';
+import { SlackMentionsSlot, SlackMessage } from './slackMentionsSlot.js';
 import { SlotConfigOverlay } from './slotConfigOverlay.js';
+import * as nls from '../../../../nls.js';
+import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
+import { IQuickInputService, IQuickPickItem } from '../../../../platform/quickinput/common/quickInput.js';
+import { IOpenerService } from '../../../../platform/opener/common/opener.js';
+import { INativeHostService } from '../../../../platform/native/common/native.js';
 
 export const CONTEXT_BUBBLE_COMMAND_ID = 'contextBubble.trigger';
 
@@ -376,15 +381,16 @@ const DEFAULT_WIDTH = 400;
 const DEFAULT_HEIGHT = 460;
 
 // ---------------------------------------------------------------------------
-// Slot factory map — adding a new data source means adding one entry here
+// Slot factory map — adding a new data source means adding one entry here.
+// Note: slackMentions is created explicitly in _createSlots() so that service
+// callbacks can be wired at construction time.
 // ---------------------------------------------------------------------------
 
 type SlotFactory = (container: HTMLElement, symbolName: string) => SlotComponent;
 
-const SLOT_FACTORIES: Record<SlotSourceId, SlotFactory> = {
+const SLOT_FACTORIES: Partial<Record<SlotSourceId, SlotFactory>> = {
 	'contextBubble.callGraph': (container, symbolName) => new CallGraphSlot(container, symbolName),
 	'contextBubble.gitHistory': (container, _symbolName) => new GitHistorySlot(container),
-	'contextBubble.slackMentions': (container, _symbolName) => new SlackMentionsSlot(container),
 };
 
 /**
@@ -439,6 +445,15 @@ export class ContextBubbleController extends Disposable {
 	 */
 	private readonly _slotInstances = new Map<SlotSourceId, SlotComponent>();
 
+	/** Slack user token loaded from secret storage. Cached for the session lifetime. */
+	private _slackToken: string | undefined;
+
+	/**
+	 * Channel list fetched once after connect and cached in memory.
+	 * Re-used by the channel picker — never re-fetched on every keystroke.
+	 */
+	private _slackChannels: { id: string; name: string }[] = [];
+
 	constructor(
 		@IWorkbenchLayoutService private readonly _layoutService: IWorkbenchLayoutService,
 		@ICodeEditorService private readonly _codeEditorService: ICodeEditorService,
@@ -447,6 +462,10 @@ export class ContextBubbleController extends Disposable {
 		@IModelService private readonly _modelService: IModelService,
 		@IEditorService private readonly _editorService: IEditorService,
 		@ISCMService private readonly _scmService: ISCMService,
+		@IStorageService private readonly _storageService: IStorageService,
+		@INativeHostService private readonly _nativeHostService: INativeHostService,
+		@IQuickInputService private readonly _quickInputService: IQuickInputService,
+		@IOpenerService private readonly _openerService: IOpenerService,
 	) {
 		super();
 		this._register(CommandsRegistry.registerCommand(CONTEXT_BUBBLE_COMMAND_ID, () => {
@@ -551,11 +570,25 @@ export class ContextBubbleController extends Disposable {
 		// the DOM until _applyLayout() positions them in the correct order.
 		const detached = document.createElement('div');
 
-		for (const sourceId of Object.keys(SLOT_FACTORIES) as SlotSourceId[]) {
-			const slot = SLOT_FACTORIES[sourceId](detached, symbolName);
+		// Call graph and git history via the factory map.
+		for (const [sourceId, factory] of Object.entries(SLOT_FACTORIES) as [SlotSourceId, SlotFactory][]) {
+			const slot = factory(detached, symbolName);
 			this._slotInstances.set(sourceId, slot);
 			this._sessionDisposables.add(slot);
 		}
+
+		// Slack mentions — created explicitly so service callbacks can be wired.
+		const slackSlot = new SlackMentionsSlot(detached, {
+			onConnectClicked: () => this._connectSlack(),
+			onDisconnectClicked: () => this._disconnectSlack(),
+			onChannelTagClicked: () => this._openChannelPicker(),
+			onChannelClearClicked: () => this._clearSlackChannel(),
+			onMessageClicked: permalink => {
+				this._openerService.open(URI.parse(permalink), { openExternal: true });
+			},
+		});
+		this._slotInstances.set('contextBubble.slackMentions', slackSlot);
+		this._sessionDisposables.add(slackSlot);
 
 		// Position slots according to saved config
 		this._applyLayout(bubble, config);
@@ -572,13 +605,8 @@ export class ContextBubbleController extends Disposable {
 		// Git history — real SCM data
 		this._fetchGitHistory();
 
-		// Slack mock — loads independently
-		const t3 = setTimeout(() => {
-			this._slotInstances.get('contextBubble.slackMentions')?.renderContent(
-				buildMockSlackMessages(symbolName)
-			);
-		}, 1100);
-		this._sessionDisposables.add({ dispose: () => clearTimeout(t3) });
+		// Slack — check for stored token and fetch or show not-configured state
+		this._initSlackSlot();
 
 		// Call graph — real LSP data via CallHierarchyModel
 		this._fetchCallGraph();
@@ -762,6 +790,299 @@ export class ContextBubbleController extends Disposable {
 				slot.setState('error');
 			}
 		});
+	}
+
+	// -------------------------------------------------------------------------
+	// Slack mentions — auth and live API fetch
+	// -------------------------------------------------------------------------
+
+	/**
+	 * Called once per session when slots are created. Reads the stored token and
+	 * either shows the not-configured state or kicks off a live fetch.
+	 */
+	private _initSlackSlot(): void {
+		const slackSlot = this._slotInstances.get('contextBubble.slackMentions') as SlackMentionsSlot | undefined;
+		if (!slackSlot) {
+			return;
+		}
+
+		Promise.resolve(this._storageService.get('contextBubble.slackToken', StorageScope.APPLICATION)).then(token => {
+			if (!token) {
+				slackSlot.renderNotConfigured();
+				return;
+			}
+			this._slackToken = token;
+			const channel = this._configurationService.getValue<string>('contextBubble.slackChannel') || undefined;
+			slackSlot.setConnectedState(true, channel);
+			this._fetchSlackMentions();
+		}, () => {
+			slackSlot.renderNotConfigured();
+		});
+	}
+
+	/**
+	 * Opens a native InputBox prompting for a Slack user token (xoxp-...).
+	 * On confirm, stores the token in secret storage and triggers a fetch.
+	 * On cancel, the slot remains in not-configured state.
+	 */
+	private _connectSlack(): void {
+		const slackSlot = this._slotInstances.get('contextBubble.slackMentions') as SlackMentionsSlot | undefined;
+		if (!slackSlot) {
+			return;
+		}
+
+		const inputBox = this._quickInputService.createInputBox();
+		inputBox.title = nls.localize('slack.connect.title', 'Connect Slack');
+		inputBox.placeholder = nls.localize('slack.connect.placeholder', 'Paste your Slack user token (xoxp-...)');
+		inputBox.password = true;
+
+		const disposables = new DisposableStore();
+		disposables.add(inputBox);
+
+		disposables.add(inputBox.onDidAccept(() => {
+			const token = inputBox.value.trim();
+			inputBox.hide();
+			disposables.dispose();
+
+			if (!token) {
+				return;
+			}
+
+			this._storageService.store('contextBubble.slackToken', token, StorageScope.APPLICATION, StorageTarget.MACHINE);
+			Promise.resolve().then(() => {
+				this._slackToken = token;
+				const channel = this._configurationService.getValue<string>('contextBubble.slackChannel') || undefined;
+				slackSlot.setConnectedState(true, channel);
+				slackSlot.setState('loading');
+				this._fetchSlackMentions();
+			}, () => {
+				slackSlot.renderNotConfigured();
+			});
+		}));
+
+		disposables.add(inputBox.onDidHide(() => {
+			disposables.dispose();
+		}));
+
+		inputBox.show();
+	}
+
+	/**
+	 * Removes the stored token, resets in-memory state, and returns the slot
+	 * to not-configured state.
+	 */
+	private _disconnectSlack(): void {
+		const slackSlot = this._slotInstances.get('contextBubble.slackMentions') as SlackMentionsSlot | undefined;
+		this._slackToken = undefined;
+		this._slackChannels = [];
+		this._storageService.remove('contextBubble.slackToken', StorageScope.APPLICATION);
+		slackSlot?.renderNotConfigured();
+	}
+
+	/**
+	 * Opens a QuickPick populated from the cached channel list so the user can
+	 * scope Slack search to a single channel. Selecting a channel writes
+	 * contextBubble.slackChannel to workspace settings and re-fetches.
+	 */
+	private _openChannelPicker(): void {
+		const slackSlot = this._slotInstances.get('contextBubble.slackMentions') as SlackMentionsSlot | undefined;
+		if (!slackSlot) {
+			return;
+		}
+
+		const quickPick = this._quickInputService.createQuickPick<IQuickPickItem>();
+		quickPick.title = nls.localize('slack.channelPicker.title', 'Filter by Slack Channel');
+		quickPick.placeholder = nls.localize('slack.channelPicker.placeholder', 'Type to filter channels...');
+		quickPick.items = this._slackChannels.map(c => ({ label: `#${c.name}`, description: c.id }));
+
+		const currentChannel = this._configurationService.getValue<string>('contextBubble.slackChannel') || undefined;
+		if (currentChannel) {
+			const active = quickPick.items.find(i => i.label === `#${currentChannel}`);
+			if (active) {
+				quickPick.activeItems = [active];
+			}
+		}
+
+		const disposables = new DisposableStore();
+		disposables.add(quickPick);
+
+		disposables.add(quickPick.onDidAccept(() => {
+			const selected = quickPick.selectedItems[0];
+			quickPick.hide();
+			disposables.dispose();
+
+			if (!selected) {
+				return;
+			}
+
+			const channelName = selected.label.replace(/^#/, '');
+			this._configurationService.updateValue(
+				'contextBubble.slackChannel', channelName, ConfigurationTarget.WORKSPACE
+			).then(() => {
+				slackSlot.setConnectedState(true, channelName);
+				slackSlot.setState('loading');
+				this._fetchSlackMentions();
+			}, () => { /* ignore write errors */ });
+		}));
+
+		disposables.add(quickPick.onDidHide(() => {
+			disposables.dispose();
+		}));
+
+		quickPick.show();
+	}
+
+	/**
+	 * Clears the active channel filter, writes `undefined` to workspace settings,
+	 * updates slot header, and re-fetches against the whole workspace.
+	 */
+	private _clearSlackChannel(): void {
+		const slackSlot = this._slotInstances.get('contextBubble.slackMentions') as SlackMentionsSlot | undefined;
+		this._configurationService.updateValue(
+			'contextBubble.slackChannel', undefined, ConfigurationTarget.WORKSPACE
+		).then(() => {
+			slackSlot?.setConnectedState(true, undefined);
+			slackSlot?.setState('loading');
+			this._fetchSlackMentions();
+		}, () => { /* ignore write errors */ });
+	}
+
+	/**
+	 * Fetches https://slack.com/api/search.messages for the current symbol name,
+	 * optionally scoped to a channel from workspace settings.
+	 *
+	 * Proxied through IRequestService (main process IPC) — never calls fetch()
+	 * directly from the renderer.
+	 */
+	private _fetchSlackMentions(): void {
+		const slackSlot = this._slotInstances.get('contextBubble.slackMentions') as SlackMentionsSlot | undefined;
+		const token = this._slackToken;
+		if (!slackSlot || !token) {
+			return;
+		}
+
+		const symbolName = this._currentSymbolName;
+		const channel = this._configurationService.getValue<string>('contextBubble.slackChannel') || undefined;
+		const showChannelBadge = !channel;
+
+		const cts = new CancellationTokenSource();
+		this._sessionDisposables.add({ dispose: () => cts.dispose(true) });
+
+		const doFetch = async () => {
+			// Guard: nothing meaningful to search for without a symbol.
+			if (!symbolName) {
+				slackSlot.renderContent([]);
+				return;
+			}
+
+			// Fetch channel list once on the first whole-workspace search so the
+			// channel picker has items immediately.  This is best-effort — a failure
+			// here must not abort the actual search.
+			if (!channel && this._slackChannels.length === 0) {
+				try {
+					await this._fetchSlackChannels(token, cts.token);
+				} catch {
+					// channel list is a convenience; continue without it
+				}
+				if (cts.token.isCancellationRequested) {
+					return;
+				}
+			}
+
+			const query = encodeURIComponent(symbolName);
+			const channelParam = channel ? `&channel=${encodeURIComponent(channel)}` : '';
+			const url = `https://slack.com/api/search.messages?query=${query}&count=10${channelParam}`;
+
+			const { statusCode, body: text } = await this._nativeHostService.fetchUrl(
+				url,
+				{ 'Authorization': `Bearer ${token}` },
+			);
+
+			if (cts.token.isCancellationRequested) {
+				return;
+			}
+
+			console.log('[contextBubble] search.messages status:', statusCode);
+			console.log('[contextBubble] search.messages body:', text.slice(0, 300));
+
+			if (!text) {
+				slackSlot.setState('error');
+				return;
+			}
+
+			const data = JSON.parse(text) as {
+				ok: boolean;
+				error?: string;
+				messages?: {
+					matches?: {
+						username?: string;
+						user?: string;
+						ts?: string;
+						text?: string;
+						channel?: { name?: string };
+						permalink?: string;
+					}[];
+				};
+			};
+
+			if (!data.ok) {
+				console.warn('[contextBubble] Slack API error:', data.error);
+				// If Slack says the auth is bad, revert to not-configured state so
+				// the user can re-enter a valid token.
+				if (data.error === 'invalid_auth' || data.error === 'token_revoked' || data.error === 'account_inactive') {
+					this._slackToken = undefined;
+					this._storageService.remove('contextBubble.slackToken', StorageScope.APPLICATION);
+					slackSlot.setConnectedState(false);
+					slackSlot.renderNotConfigured();
+				} else {
+					slackSlot.setState('error');
+				}
+				return;
+			}
+
+			const matches = data.messages?.matches ?? [];
+			const messages: SlackMessage[] = matches.map(m => ({
+				username: m.username ?? m.user ?? 'unknown',
+				content: m.text ?? '',
+				relativeTime: _formatRelativeTime(Math.floor(parseFloat(m.ts ?? '0') * 1000)),
+				channelName: showChannelBadge ? (m.channel?.name ?? undefined) : undefined,
+				permalink: m.permalink ?? '',
+			}));
+
+			slackSlot.renderContent(messages);
+		};
+
+		doFetch().catch((err) => {
+			console.error('[contextBubble] doFetch threw:', err);
+			if (!cts.token.isCancellationRequested) {
+				slackSlot.setState('error');
+			}
+		});
+	}
+
+	/**
+	 * Fetches the workspace channel list via conversations.list and caches it in
+	 * `_slackChannels`. Called at most once per session (before first whole-workspace
+	 * search). The cached list is used by the channel picker without re-fetching.
+	 */
+	private async _fetchSlackChannels(token: string, _cancellationToken: CancellationToken): Promise<void> {
+		const { body: text } = await this._nativeHostService.fetchUrl(
+			'https://slack.com/api/conversations.list?types=public_channel,private_channel&limit=200&exclude_archived=true',
+			{ 'Authorization': `Bearer ${token}` },
+		);
+
+		if (!text) {
+			return;
+		}
+
+		const data = JSON.parse(text) as {
+			ok: boolean;
+			channels?: { id: string; name: string }[];
+		};
+
+		if (data.ok && Array.isArray(data.channels)) {
+			this._slackChannels = data.channels.map(c => ({ id: c.id, name: c.name }));
+		}
 	}
 
 	/**
@@ -1017,6 +1338,8 @@ export class ContextBubbleController extends Disposable {
 		this._sessionDisposables.clear();
 		this._slotInstances.clear();
 		this._callNodeLocations.clear();
+		this._slackToken = undefined;
+		this._slackChannels = [];
 		this._anchoredEditor = undefined;
 		this._currentSymbolName = '';
 		this._currentModel = null;

@@ -61,5 +61,10 @@ Registry.as<IConfigurationRegistry>(ConfigurationExtensions.Configuration).regis
 				},
 			},
 		},
+		'contextBubble.slackChannel': {
+			type: 'string',
+			markdownDescription: 'Scope the Slack mentions slot to a specific channel name (e.g. `general`). Leave empty to search the whole workspace.',
+			default: '',
+		},
 	},
 });

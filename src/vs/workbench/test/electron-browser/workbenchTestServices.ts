@@ -197,6 +197,7 @@ export class TestNativeHostService implements INativeHostService {
 	async startPowerSaveBlocker(type: PowerSaveBlockerType): Promise<number> { return -1; }
 	async stopPowerSaveBlocker(id: number): Promise<boolean> { return false; }
 	async isPowerSaveBlockerStarted(id: number): Promise<boolean> { return false; }
+	async fetchUrl(_url: string, _headers: Record<string, string>): Promise<{ statusCode: number; body: string }> { return { statusCode: 200, body: '' }; }
 }
 
 export class TestExtensionTipsService extends AbstractNativeExtensionTipsService {

@@ -46,7 +46,7 @@ import { CancellationError } from '../../../base/common/errors.js';
 import { zip } from '../../../base/node/zip.js';
 import { IConfigurationService } from '../../configuration/common/configuration.js';
 import { IProxyAuthService } from './auth.js';
-import { AuthInfo, Credentials, IRequestService } from '../../request/common/request.js';
+import { AuthInfo, Credentials, IRequestService, asText } from '../../request/common/request.js';
 import { randomPath } from '../../../base/common/extpath.js';
 import { CancellationTokenSource } from '../../../base/common/cancellation.js';
 
@@ -1309,6 +1309,17 @@ export class NativeHostMainService extends Disposable implements INativeHostMain
 	}
 
 	//#endregion
+
+	async fetchUrl(_windowId: number | undefined, url: string, headers: Record<string, string>): Promise<{ statusCode: number; body: string }> {
+		const cts = new CancellationTokenSource();
+		try {
+			const response = await this.requestService.request({ type: 'GET', url, headers, callSite: 'nativeHostMainService.fetchUrl' }, cts.token);
+			const body = await asText(response) ?? '';
+			return { statusCode: response.res.statusCode ?? 200, body };
+		} finally {
+			cts.dispose(true);
+		}
+	}
 
 	private windowById(windowId: number | undefined, fallbackCodeWindowId?: number): ICodeWindow | IAuxiliaryWindow | undefined {
 		return this.codeWindowById(windowId) ?? this.auxiliaryWindowById(windowId) ?? this.codeWindowById(fallbackCodeWindowId);

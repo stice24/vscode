@@ -276,6 +276,9 @@ export interface ICommonNativeHostService {
 	startPowerSaveBlocker(type: PowerSaveBlockerType): Promise<number>;
 	stopPowerSaveBlocker(id: number): Promise<boolean>;
 	isPowerSaveBlockerStarted(id: number): Promise<boolean>;
+
+	// HTTP (routes through Node.js main process — no CORS restrictions)
+	fetchUrl(url: string, headers: Record<string, string>): Promise<{ statusCode: number; body: string }>;
 }
 
 /**
