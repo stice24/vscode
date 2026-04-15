@@ -233,6 +233,226 @@ function ensureWidgetStyles(): void {
 	background: rgba(80, 200, 220, 0.12);
 }
 
+/* ---- Theme toggle button ---- */
+.context-bubble-btn-theme {
+	background: none;
+	border: none;
+	cursor: pointer;
+	color: rgba(210, 220, 230, 0.95);
+	font-size: 12px;
+	line-height: 1;
+	padding: 2px 5px;
+	border-radius: 3px;
+	opacity: 0.38;
+	transition: opacity 0.15s, background 0.1s;
+}
+.context-bubble-widget.is-hovered .context-bubble-btn-theme {
+	opacity: 0.72;
+}
+.context-bubble-btn-theme:hover {
+	opacity: 1 !important;
+	background: rgba(80, 200, 220, 0.12);
+}
+
+/* ---- Light mode overrides ---- */
+.context-bubble-widget.is-light {
+	background: linear-gradient(180deg, #f7f8fa 0%, #f0f2f5 100%);
+	box-shadow:
+		0 0 0 1px rgba(60, 130, 150, 0.15),
+		0 2px 10px rgba(0, 0, 0, 0.12),
+		0 16px 52px rgba(0, 0, 0, 0.10);
+}
+.context-bubble-widget.is-light.is-hovered {
+	box-shadow:
+		0 0 0 1px rgba(60, 130, 150, 0.28),
+		0 2px 10px rgba(0, 0, 0, 0.14),
+		0 16px 52px rgba(0, 0, 0, 0.12);
+}
+.context-bubble-widget.is-light.is-dragging {
+	box-shadow:
+		0 0 0 1px rgba(60, 130, 150, 0.38),
+		0 6px 20px rgba(0, 0, 0, 0.18),
+		0 24px 64px rgba(0, 0, 0, 0.14);
+}
+.context-bubble-widget.is-light .context-bubble-chrome {
+	background: rgba(235, 238, 243, 0.98);
+	border-bottom-color: rgba(60, 130, 150, 0.12);
+}
+.context-bubble-widget.is-light .context-bubble-title {
+	color: rgba(40, 50, 65, 0.55);
+}
+.context-bubble-widget.is-light .context-bubble-btn-hide,
+.context-bubble-widget.is-light .context-bubble-btn-close,
+.context-bubble-widget.is-light .context-bubble-btn-config,
+.context-bubble-widget.is-light .context-bubble-btn-theme {
+	color: rgba(30, 40, 55, 0.85);
+}
+.context-bubble-widget.is-light .context-bubble-btn-hide:hover,
+.context-bubble-widget.is-light .context-bubble-btn-close:hover,
+.context-bubble-widget.is-light .context-bubble-btn-config:hover,
+.context-bubble-widget.is-light .context-bubble-btn-theme:hover {
+	background: rgba(60, 130, 150, 0.10);
+}
+.context-bubble-widget.is-light .context-bubble-slot + .context-bubble-slot::before {
+	background: linear-gradient(
+		to right,
+		transparent 0%,
+		rgba(60, 130, 150, 0.18) 20%,
+		rgba(60, 130, 150, 0.18) 80%,
+		transparent 100%
+	);
+}
+
+/* ---- Light mode: slot base ---- */
+.context-bubble-widget.is-light .slot-label {
+	color: rgba(40, 60, 80, 0.5);
+}
+.context-bubble-widget.is-light .slot-skeleton-bar {
+	background: rgba(60, 90, 120, 0.15);
+}
+.context-bubble-widget.is-light .slot-error-msg {
+	color: rgba(160, 60, 50, 0.85);
+}
+
+/* ---- Light mode: call graph SVG ---- */
+.context-bubble-widget.is-light .call-graph-node circle {
+	fill: rgba(60, 100, 140, 0.10);
+	stroke: rgba(50, 100, 140, 0.60);
+}
+.context-bubble-widget.is-light .call-graph-node text {
+	fill: rgba(25, 50, 75, 0.88);
+}
+/* Centre node — teal tint, more prominent */
+.context-bubble-widget.is-light .call-graph-node--center circle {
+	fill: rgba(15, 110, 90, 0.12);
+	stroke: rgba(15, 110, 90, 0.80);
+}
+.context-bubble-widget.is-light .call-graph-node--center text {
+	fill: rgba(10, 95, 78, 0.95);
+}
+.context-bubble-widget.is-light .call-graph-svg line {
+	stroke: rgba(50, 100, 135, 0.55);
+}
+.context-bubble-widget.is-light .call-graph-svg defs marker polygon {
+	fill: rgba(50, 100, 135, 0.75);
+}
+.context-bubble-widget.is-light .call-graph-svg text {
+	fill: rgba(25, 50, 75, 0.75);
+}
+.context-bubble-widget.is-light .call-graph-svg rect {
+	fill: rgba(60, 100, 140, 0.08);
+	stroke: rgba(50, 100, 140, 0.50);
+}
+/* Tooltip pill — needs light bg in light mode */
+.context-bubble-widget.is-light .call-graph-tooltip rect {
+	fill: rgba(235, 240, 246, 0.97);
+	stroke: rgba(15, 110, 90, 0.45);
+}
+.context-bubble-widget.is-light .call-graph-tooltip text {
+	fill: rgba(18, 45, 65, 0.95);
+}
+
+/* ---- Light mode: call graph history bar ---- */
+.context-bubble-widget.is-light .call-graph-history-bar {
+	background: rgba(225, 230, 238, 0.98);
+	border-top-color: rgba(50, 130, 150, 0.40);
+}
+.context-bubble-widget.is-light .call-graph-history-btn {
+	color: rgba(25, 110, 130, 0.90);
+	border-color: rgba(25, 110, 130, 0.35);
+}
+.context-bubble-widget.is-light .call-graph-history-btn:disabled {
+	color: rgba(90, 115, 130, 0.35);
+	border-color: rgba(90, 115, 130, 0.18);
+}
+.context-bubble-widget.is-light .call-graph-history-btn:not(:disabled):hover {
+	background: rgba(25, 110, 130, 0.12);
+	border-color: rgba(25, 110, 130, 0.55);
+}
+.context-bubble-widget.is-light .call-graph-history-label {
+	color: rgba(25, 45, 65, 0.90);
+}
+
+/* ---- Light mode: git history ---- */
+.context-bubble-widget.is-light .git-commit-entry {
+	border-left-color: rgba(30, 120, 140, 0.32);
+}
+.context-bubble-widget.is-light .git-commit-entry:hover {
+	background: rgba(30, 120, 140, 0.06);
+	border-left-color: rgba(30, 120, 140, 0.52);
+}
+.context-bubble-widget.is-light .git-commit-hash {
+	color: rgba(40, 75, 100, 0.68);
+}
+.context-bubble-widget.is-light .git-commit-author {
+	color: rgba(35, 60, 80, 0.78);
+}
+.context-bubble-widget.is-light .git-commit-time {
+	color: rgba(60, 85, 105, 0.52);
+}
+.context-bubble-widget.is-light .git-commit-message {
+	color: rgba(18, 38, 58, 0.82);
+}
+.context-bubble-widget.is-light .git-pr-tag {
+	color: rgba(15, 100, 80, 0.90);
+	background: rgba(15, 100, 80, 0.09);
+	border-color: rgba(15, 100, 80, 0.22);
+}
+
+/* ---- Light mode: slack mentions ---- */
+.context-bubble-widget.is-light .slack-slot-label {
+	color: rgba(40, 65, 85, 0.52);
+}
+.context-bubble-widget.is-light .slack-message-entry:hover {
+	background: rgba(30, 120, 140, 0.05);
+}
+.context-bubble-widget.is-light .slack-username {
+	color: rgba(15, 100, 82, 0.90);
+}
+.context-bubble-widget.is-light .slack-timestamp {
+	color: rgba(60, 85, 105, 0.52);
+}
+.context-bubble-widget.is-light .slack-channel-badge {
+	color: rgba(15, 100, 82, 0.80);
+	background: rgba(15, 100, 82, 0.07);
+	border-color: rgba(15, 100, 82, 0.18);
+}
+.context-bubble-widget.is-light .slack-message-body {
+	color: rgba(18, 38, 58, 0.80);
+}
+.context-bubble-widget.is-light .slack-no-results {
+	color: rgba(60, 85, 105, 0.50);
+}
+.context-bubble-widget.is-light .slack-disconnect-btn {
+	color: rgba(60, 85, 105, 0.50);
+}
+.context-bubble-widget.is-light .slack-disconnect-btn:hover {
+	color: rgba(160, 50, 50, 0.85);
+	background: rgba(160, 50, 50, 0.08);
+}
+.context-bubble-widget.is-light .slack-channel-tag {
+	color: rgba(15, 100, 82, 0.88);
+	background: rgba(15, 100, 82, 0.09);
+	border-color: rgba(15, 100, 82, 0.22);
+}
+.context-bubble-widget.is-light .slack-search-icon {
+	color: rgba(60, 85, 105, 0.45);
+}
+.context-bubble-widget.is-light .slack-search-icon:hover {
+	color: rgba(15, 100, 82, 0.75);
+	background: rgba(15, 100, 82, 0.07);
+}
+.context-bubble-widget.is-light .slack-connect-btn {
+	color: rgba(15, 100, 82, 0.88);
+	background: rgba(15, 100, 82, 0.09);
+	border-color: rgba(15, 100, 82, 0.25);
+}
+.context-bubble-widget.is-light .slack-connect-btn:hover {
+	background: rgba(15, 100, 82, 0.16);
+	border-color: rgba(15, 100, 82, 0.42);
+	color: rgba(15, 100, 82, 1);
+}
+
 `;
 	mainWindow.document.head.appendChild(style);
 }
@@ -307,6 +527,7 @@ export class ContextBubbleWidget extends Disposable {
 
 	private _dragState: IDragState | null = null;
 	private _resizeState: IResizeState | null = null;
+	private _isLight = false;
 
 	constructor(private readonly _container: HTMLElement) {
 		super();
@@ -414,6 +635,8 @@ export class ContextBubbleWidget extends Disposable {
 		const controls = document.createElement('span');
 		controls.className = 'context-bubble-controls';
 
+		const themeBtn = this._buildChromeButton('\u2600', 'context-bubble-btn-theme', () => this._toggleTheme(themeBtn));
+		controls.appendChild(themeBtn);
 		controls.appendChild(this._buildChromeButton('\u2699', 'context-bubble-btn-config', () => this._onDidRequestConfig.fire()));
 		controls.appendChild(this._buildChromeButton('\u2212', 'context-bubble-btn-hide', () => this.hide()));
 		controls.appendChild(this._buildChromeButton('\u00d7', 'context-bubble-btn-close', () => this.close()));
@@ -471,6 +694,16 @@ export class ContextBubbleWidget extends Disposable {
 		this._disposables.add(dom.addDisposableListener(el, 'mousedown', e => this._onResizeStart(e, handle)));
 
 		return el;
+	}
+
+	// -------------------------------------------------------------------------
+	// Theme toggle
+	// -------------------------------------------------------------------------
+
+	private _toggleTheme(btn: HTMLElement): void {
+		this._isLight = !this._isLight;
+		this._element.classList.toggle('is-light', this._isLight);
+		btn.textContent = this._isLight ? '\u263e' : '\u2600';
 	}
 
 	// -------------------------------------------------------------------------

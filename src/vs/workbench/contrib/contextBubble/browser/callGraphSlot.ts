@@ -478,6 +478,9 @@ export class CallGraphSlot extends SlotComponent {
 	): void {
 		const g = document.createElementNS(SVG_NS, 'g') as SVGGElement;
 		g.classList.add('call-graph-node');
+		if (isCenter) {
+			g.classList.add('call-graph-node--center');
+		}
 
 		const circle = document.createElementNS(SVG_NS, 'circle') as SVGCircleElement;
 		circle.setAttribute('cx', String(pos.x));
@@ -536,6 +539,7 @@ export class CallGraphSlot extends SlotComponent {
 		const pillY = Math.max(3, pos.y - r - pillH - 5);
 
 		const g = document.createElementNS(SVG_NS, 'g') as SVGGElement;
+		g.classList.add('call-graph-tooltip');
 
 		const rect = document.createElementNS(SVG_NS, 'rect') as SVGRectElement;
 		rect.setAttribute('x', String(pillX));
