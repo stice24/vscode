@@ -24,6 +24,7 @@ import { CallHierarchyModel } from '../../callHierarchy/common/callHierarchy.js'
 import { ContextBubbleWidget } from './contextBubbleWidget.js';
 import { ContextBubbleAnchor } from './contextBubbleAnchor.js';
 import { ContextBubbleArrow } from './contextBubbleArrow.js';
+import { PartialSelectionPrompt } from './contextSelectionPrompt.js';
 import {
 	SlotComponent,
 	ISlotConfig, DEFAULT_SLOT_CONFIG, SlotSourceId, SlotPositionKey,
@@ -378,6 +379,39 @@ function _rangeContains(outer: IRange, inner: IRange): boolean {
 	return true;
 }
 
+function _rangesEqual(a: IRange, b: IRange): boolean {
+	return a.startLineNumber === b.startLineNumber
+		&& a.startColumn === b.startColumn
+		&& a.endLineNumber === b.endLineNumber
+		&& a.endColumn === b.endColumn;
+}
+
+/**
+ * Walks a DocumentSymbol tree to find the deepest function, method, constructor,
+ * or class whose range fully contains `selectionRange`.
+ * Returns `undefined` when no single symbol encloses the entire selection
+ * (i.e. the selection spans multiple top-level symbols or falls outside all of them).
+ */
+function _findEnclosingFunctionOrClass(symbols: DocumentSymbol[], selectionRange: IRange): DocumentSymbol | undefined {
+	for (const sym of symbols) {
+		if (_rangeContains(sym.range, selectionRange)) {
+			const fromChild = _findEnclosingFunctionOrClass(sym.children ?? [], selectionRange);
+			if (fromChild !== undefined) {
+				return fromChild;
+			}
+			if (
+				sym.kind === SymbolKind.Function ||
+				sym.kind === SymbolKind.Method ||
+				sym.kind === SymbolKind.Constructor ||
+				sym.kind === SymbolKind.Class
+			) {
+				return sym;
+			}
+		}
+	}
+	return undefined;
+}
+
 /** Default bubble dimensions — kept in sync with constants in contextBubbleWidget.ts. */
 const DEFAULT_WIDTH = 400;
 const DEFAULT_HEIGHT = 460;
@@ -418,6 +452,12 @@ export class ContextBubbleController extends Disposable {
 	 * Cleared entirely on teardown so nothing outlives the session.
 	 */
 	private readonly _sessionDisposables = this._register(new DisposableStore());
+
+	/**
+	 * The active partial-selection prompt, if any. Only one can exist at a time.
+	 * Replaced (and the previous one disposed) whenever a new trigger starts.
+	 */
+	private readonly _promptSlot = this._register(new MutableDisposable<DisposableStore>());
 
 	/**
 	 * The editor that owns the current anchor.
@@ -498,12 +538,96 @@ export class ContextBubbleController extends Disposable {
 			return;
 		}
 
-		// First press: place the anchor, do not open the bubble yet
 		const editorContext = this._resolveEditorContext();
 		if (!editorContext) {
 			return;
 		}
 
+		// Dismiss any existing partial-selection prompt before starting a new check
+		this._promptSlot.value = undefined;
+
+		// Async partial-selection check — places the anchor when done.
+		// Falls back to normal anchor placement if the symbol check throws.
+		this._checkPartialSelectionAndMaybeTrigger(editorContext).catch(() => {
+			if (!this._anchorSlot.value) {
+				this._placeAnchor(editorContext);
+			}
+		});
+	}
+
+	/**
+	 * Queries DocumentSymbolProvider for the current model. If the editor selection
+	 * is a strict subset of a single enclosing function or class, shows the partial-
+	 * selection prompt instead of immediately placing the anchor. Otherwise calls
+	 * `_placeAnchor` directly.
+	 */
+	private async _checkPartialSelectionAndMaybeTrigger(editorContext: {
+		editor: ICodeEditor;
+		lineNumber: number;
+		selectionRange: IRange;
+		symbolName: string;
+		model: ITextModel | null;
+		position: IPosition;
+	}): Promise<void> {
+		const { model, selectionRange, editor } = editorContext;
+
+		if (!model) {
+			this._placeAnchor(editorContext);
+			return;
+		}
+
+		const [symProvider] = this._languageFeaturesService.documentSymbolProvider.ordered(model);
+		if (!symProvider) {
+			this._placeAnchor(editorContext);
+			return;
+		}
+
+		const cts = new CancellationTokenSource();
+		let symbols: DocumentSymbol[];
+		try {
+			symbols = await symProvider.provideDocumentSymbols(model, cts.token) ?? [];
+		} catch {
+			cts.dispose(true);
+			if (!this._anchorSlot.value) {
+				this._placeAnchor(editorContext);
+			}
+			return;
+		}
+		cts.dispose();
+
+		// If the trigger context changed while awaiting (user pressed hotkey again,
+		// anchor placed by another code path), do nothing.
+		if (this._anchorSlot.value) {
+			return;
+		}
+
+		const enclosing = _findEnclosingFunctionOrClass(symbols, selectionRange);
+
+		if (!enclosing) {
+			// No single symbol fully contains the selection (spans multiple or none) → normal
+			this._placeAnchor(editorContext);
+			return;
+		}
+
+		if (_rangesEqual(selectionRange, enclosing.range)) {
+			// Selection already covers the full symbol → normal
+			this._placeAnchor(editorContext);
+			return;
+		}
+
+		// Partial selection — show the prompt
+		this._showPartialPrompt(editor, selectionRange, enclosing);
+	}
+
+	/** Places the gutter anchor and wires its click handler. Extracted so both the
+	 *  direct hotkey path and the prompt's confirm path share the same logic. */
+	private _placeAnchor(editorContext: {
+		editor: ICodeEditor;
+		lineNumber: number;
+		symbolName: string;
+		model: ITextModel | null;
+		position: IPosition;
+	}): void {
 		this._currentSymbolName = editorContext.symbolName;
 		this._currentModel = editorContext.model;
 		this._currentPosition = editorContext.position;
@@ -519,6 +643,67 @@ export class ContextBubbleController extends Disposable {
 		this._sessionDisposables.add(
 			editorContext.editor.onDidScrollChange(() => this._updateArrow())
 		);
+	}
+
+	/**
+	 * Creates and displays the partial-selection prompt adjacent to the end of
+	 * the selection. Wires the confirm (expand) and dismiss actions.
+	 */
+	private _showPartialPrompt(
+		editor: ICodeEditor,
+		selectionRange: IRange,
+		symbol: DocumentSymbol,
+	): void {
+		const container = this._layoutService.getContainer(mainWindow);
+		const containerRect = container.getBoundingClientRect();
+		const editorDomNode = editor.getDomNode();
+		if (!editorDomNode) {
+			return;
+		}
+
+		const editorRect = editorDomNode.getBoundingClientRect();
+		const layout = editor.getLayoutInfo();
+		const scrolledPos = editor.getScrolledVisiblePosition({
+			lineNumber: selectionRange.endLineNumber,
+			column: selectionRange.endColumn,
+		});
+
+		if (!scrolledPos) {
+			// End of selection is outside the visible viewport — fall through to normal
+			const editorContext = this._resolveEditorContext();
+			if (editorContext && !this._anchorSlot.value) {
+				this._placeAnchor(editorContext);
+			}
+			return;
+		}
+
+		// Position the prompt just below the selection end, horizontally aligned
+		// with the end character, clamped so it stays within the container.
+		const rawX = editorRect.left + layout.contentLeft + scrolledPos.left - containerRect.left;
+		const rawY = editorRect.top + scrolledPos.top + scrolledPos.height - containerRect.top + 6;
+		const x = Math.max(4, Math.min(rawX, containerRect.width - 280));
+		const y = Math.max(4, Math.min(rawY, containerRect.height - 40));
+
+		const store = new DisposableStore();
+		const prompt = store.add(new PartialSelectionPrompt(container, x, y, symbol.name));
+
+		store.add(prompt.onDidSelectSymbol(() => {
+			// Expand selection to the full symbol range, then re-trigger normally
+			this._promptSlot.value = undefined;
+			editor.setSelection({
+				startLineNumber: symbol.range.startLineNumber,
+				startColumn: symbol.range.startColumn,
+				endLineNumber: symbol.range.endLineNumber,
+				endColumn: symbol.range.endColumn,
+			});
+			this._triggerBubble();
+		}));
+
+		store.add(prompt.onDidDismiss(() => {
+			this._promptSlot.value = undefined;
+		}));
+
+		this._promptSlot.value = store;
 	}
 
 	// -------------------------------------------------------------------------
@@ -1488,6 +1673,7 @@ export class ContextBubbleController extends Disposable {
 	private _resolveEditorContext(): {
 		editor: ICodeEditor;
 		lineNumber: number;
+		selectionRange: IRange;
 		symbolName: string;
 		model: ITextModel | null;
 		position: IPosition;
@@ -1503,9 +1689,8 @@ export class ContextBubbleController extends Disposable {
 			return undefined;
 		}
 
-		// The trigger is always a highlighted function — extract the symbol name
-		// and LSP position from the selection. startLineNumber is the topmost line
-		// regardless of drag direction, which is where the declaration lives.
+		// Symbol name and LSP position are extracted from the top of the selection
+		// (startLineNumber) since that is where the declaration lives.
 		const model = editor.getModel();
 		const { symbolName, position } = model
 			? _resolveSymbolFromSelection(model, selection.startLineNumber, selection.endLineNumber)
@@ -1513,7 +1698,14 @@ export class ContextBubbleController extends Disposable {
 
 		return {
 			editor,
-			lineNumber: selection.selectionStartLineNumber,
+			// Fix 1: anchor is placed at the END of the selection, not the start.
+			lineNumber: selection.endLineNumber,
+			selectionRange: {
+				startLineNumber: selection.startLineNumber,
+				startColumn: selection.startColumn,
+				endLineNumber: selection.endLineNumber,
+				endColumn: selection.endColumn,
+			},
 			symbolName,
 			model,
 			position,
