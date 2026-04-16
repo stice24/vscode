@@ -412,20 +412,62 @@ function _findEnclosingFunctionOrClass(symbols: DocumentSymbol[], selectionRange
 	return undefined;
 }
 
+// ---------------------------------------------------------------------------
+// Dependency graph helpers (class mode)
+// ---------------------------------------------------------------------------
+
+/**
+ * Extracts the primary imported identifier from an import statement line.
+ * Handles named imports `{ X, Y }` (returns X), default imports `import X`,
+ * and namespace imports `import * as X`. Falls back to the URI basename.
+ *
+ * The link provider gives us the range of the import path string; we inspect
+ * the same source line to extract the imported name, which is more meaningful
+ * as a node label than the module path.
+ */
+function _extractImportedName(lineText: string, fallbackUri: URI): string {
+	// Named imports: import { AuthService } from '...'  or  import { A, B } from '...'
+	const namedMatch = /import\s+(?:type\s+)?\{([^}]+)\}/.exec(lineText);
+	if (namedMatch) {
+		const first = namedMatch[1].split(',')[0].trim();
+		// Handle aliasing: `AuthService as Auth` → take the exported name (AuthService)
+		const beforeAs = first.split(/\s+as\s+/)[0].trim();
+		if (beforeAs) {
+			return beforeAs;
+		}
+	}
+	// Namespace import: import * as ns from '...'
+	const starMatch = /import\s+\*\s+as\s+([A-Za-z_$][A-Za-z0-9_$]*)/.exec(lineText);
+	if (starMatch) {
+		return starMatch[1];
+	}
+	// Default import: import Name from '...'  (not a keyword, not '*')
+	const defaultMatch = /import\s+([A-Za-z_$][A-Za-z0-9_$]*)/.exec(lineText);
+	if (defaultMatch && defaultMatch[1] !== 'type') {
+		return defaultMatch[1];
+	}
+	return _fileBasename(fallbackUri);
+}
+
+/** Strips the directory path and file extension from a URI, returning the bare module name. */
+function _fileBasename(uri: URI): string {
+	const base = uri.path.split('/').pop() ?? '';
+	return base.replace(/\.[^.]+$/, '');
+}
+
 /** Default bubble dimensions — kept in sync with constants in contextBubbleWidget.ts. */
 const DEFAULT_WIDTH = 400;
 const DEFAULT_HEIGHT = 460;
 
 // ---------------------------------------------------------------------------
 // Slot factory map — adding a new data source means adding one entry here.
-// Note: slackMentions is created explicitly in _createSlots() so that service
-// callbacks can be wired at construction time.
+// Note: callGraph and slackMentions are created explicitly in _createSlots()
+// so that extra construction-time arguments can be passed.
 // ---------------------------------------------------------------------------
 
 type SlotFactory = (container: HTMLElement, symbolName: string) => SlotComponent;
 
 const SLOT_FACTORIES: Partial<Record<SlotSourceId, SlotFactory>> = {
-	'contextBubble.callGraph': (container, symbolName) => new CallGraphSlot(container, symbolName),
 	'contextBubble.gitHistory': (container, _symbolName) => new GitHistorySlot(container),
 };
 
@@ -470,6 +512,14 @@ export class ContextBubbleController extends Disposable {
 	 * call graph and as the search term for Slack mentions.
 	 */
 	private _currentSymbolName = '';
+
+	/**
+	 * Symbol type determined at trigger time. Set from a fast regex hint first,
+	 * then overridden by the DocumentSymbolProvider result in
+	 * `_checkPartialSelectionAndMaybeTrigger`. Invariant once the bubble is open
+	 * — does not change during cmd-click navigation within a session.
+	 */
+	private _currentSymbolType: 'function' | 'class' = 'function';
 
 	/** Editor model and cursor position captured at trigger time — used for LSP call hierarchy. */
 	private _currentModel: ITextModel | null = null;
@@ -546,6 +596,10 @@ export class ContextBubbleController extends Disposable {
 		// Dismiss any existing partial-selection prompt before starting a new check
 		this._promptSlot.value = undefined;
 
+		// Apply the fast regex hint immediately so the catch/fallback path has a
+		// reasonable value even if the async LSP check never runs.
+		this._currentSymbolType = editorContext.symbolTypeHint;
+
 		// Async partial-selection check — places the anchor when done.
 		// Falls back to normal anchor placement if the symbol check throws.
 		this._checkPartialSelectionAndMaybeTrigger(editorContext).catch(() => {
@@ -607,6 +661,17 @@ export class ContextBubbleController extends Disposable {
 			// No single symbol fully contains the selection (spans multiple or none) → normal
 			this._placeAnchor(editorContext);
 			return;
+		}
+
+		// Override the regex hint with the authoritative LSP kind.
+		if (
+			enclosing.kind === SymbolKind.Class ||
+			enclosing.kind === SymbolKind.Interface ||
+			enclosing.kind === SymbolKind.Enum
+		) {
+			this._currentSymbolType = 'class';
+		} else {
+			this._currentSymbolType = 'function';
 		}
 
 		if (_rangesEqual(selectionRange, enclosing.range)) {
@@ -762,7 +827,14 @@ export class ContextBubbleController extends Disposable {
 		// the DOM until _applyLayout() positions them in the correct order.
 		const detached = document.createElement('div');
 
-		// Call graph and git history via the factory map.
+		// Call graph — created explicitly so symbolType can be passed at construction.
+		// The slot label ("Call Graph" vs "Dependencies") and empty-state text are
+		// determined by symbolType and do not change during the session.
+		const callGraphSlot = new CallGraphSlot(detached, symbolName, this._currentSymbolType);
+		this._slotInstances.set('contextBubble.callGraph', callGraphSlot);
+		this._sessionDisposables.add(callGraphSlot);
+
+		// Git history and any other factory-mapped slots.
 		for (const [sourceId, factory] of Object.entries(SLOT_FACTORIES) as [SlotSourceId, SlotFactory][]) {
 			const slot = factory(detached, symbolName);
 			this._slotInstances.set(sourceId, slot);
@@ -785,9 +857,9 @@ export class ContextBubbleController extends Disposable {
 		// Position slots according to saved config
 		this._applyLayout(bubble, config);
 
-		// Wire cmd-click navigation from the call graph slot
+		// Wire cmd-click navigation from the call graph slot.
+		// callGraphSlot is already declared above; read from _slotInstances via cast.
 		this._callNodeLocations.clear();
-		const callGraphSlot = this._slotInstances.get('contextBubble.callGraph') as CallGraphSlot | undefined;
 		if (callGraphSlot) {
 			this._sessionDisposables.add(
 				callGraphSlot.onNodeCmdClick(name => this._navigateToNode(name))
@@ -805,10 +877,28 @@ export class ContextBubbleController extends Disposable {
 	}
 
 	// -------------------------------------------------------------------------
-	// Call graph — LSP fetch
+	// Call graph — dispatch by symbol type
 	// -------------------------------------------------------------------------
 
+	/**
+	 * Entry point called whenever call graph data needs to be (re-)fetched.
+	 * Dispatches to the appropriate strategy based on the current symbol type:
+	 * - function → CallHierarchyProvider (with Reference + text fallbacks)
+	 * - class    → LinkProvider (outgoing imports) + ReferenceProvider (incoming importers)
+	 */
 	private _fetchCallGraph(): void {
+		if (this._currentSymbolType === 'class') {
+			this._fetchDependencyGraph();
+		} else {
+			this._fetchFunctionCallGraph();
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// Function call graph — LSP fetch (unchanged from original implementation)
+	// -------------------------------------------------------------------------
+
+	private _fetchFunctionCallGraph(): void {
 		const model = this._currentModel;
 		const position = this._currentPosition;
 		const slot = this._slotInstances.get('contextBubble.callGraph');
@@ -839,19 +929,9 @@ export class ContextBubbleController extends Disposable {
 					}
 
 					// Filter out-edges to project-local functions only.
-					// Callees whose uri does not fall under a workspace folder
+					// Callees whose URI does not fall under a workspace folder
 					// (e.g. node_modules, stdlib .d.ts files) are excluded.
-					const workspaceFolders = this._workspaceContextService.getWorkspace().folders;
-					const localOutgoing = workspaceFolders.length > 0
-						? outgoing.filter(c => {
-							const uriStr = c.to.uri.toString();
-							return workspaceFolders.some(f => {
-								const root = f.uri.toString();
-								const rootWithSlash = root.endsWith('/') ? root : root + '/';
-								return uriStr.startsWith(rootWithSlash) || uriStr === root;
-							});
-						})
-						: outgoing;
+					const localOutgoing = outgoing.filter(c => this._isLocalUri(c.to.uri));
 
 					// Store precise locations for cmd-click navigation
 					for (const c of incoming) {
@@ -917,6 +997,169 @@ export class ContextBubbleController extends Disposable {
 			} else {
 				slot.renderContent({ callers: [], callees: [] });
 			}
+		};
+
+		doFetch().catch(() => {
+			if (!cts.token.isCancellationRequested) {
+				slot.setState('error');
+			}
+		});
+	}
+
+	// -------------------------------------------------------------------------
+	// Dependency graph — class mode fetch
+	// -------------------------------------------------------------------------
+
+	/**
+	 * Builds the dependency graph for a class symbol.
+	 *
+	 * **Outgoing** (what this class imports):
+	 *   Uses `LinkProvider`, which resolves import path strings to absolute file
+	 *   URIs. Filtered to project-local URIs via `_isLocalUri`. The imported
+	 *   identifier name is extracted from the import line text and used as the
+	 *   node label; the URI basename is used as a fallback.
+	 *
+	 *   If no LinkProvider is registered (e.g. TypeScript server not active),
+	 *   outgoing deps are empty — documented here, no error state raised.
+	 *
+	 * **Incoming** (who imports this class):
+	 *   Uses `ReferenceProvider` at the class declaration position. All cross-file
+	 *   references whose containing line matches `/\bimport\b/` are treated as
+	 *   import sites (files that import this class). Filtered to project-local URIs.
+	 *
+	 *   If no ReferenceProvider is registered, incoming deps are empty — same
+	 *   graceful degradation as outgoing.
+	 *
+	 * The graph visual language is identical to function mode: centre node,
+	 * directed edges, in/out layout, same node and edge styling. The data
+	 * semantics change; the rendering does not.
+	 */
+	private _fetchDependencyGraph(): void {
+		const model = this._currentModel;
+		const position = this._currentPosition;
+		const slot = this._slotInstances.get('contextBubble.callGraph');
+		if (!slot || !model || !position) {
+			slot?.renderContent({ callers: [], callees: [] });
+			return;
+		}
+
+		const cts = new CancellationTokenSource();
+		this._sessionDisposables.add({ dispose: () => cts.dispose(true) });
+
+		const doFetch = async () => {
+			// ---- OUTGOING: what does this class import? -------------------------
+			const outgoingNames: string[] = [];
+			const [linkProvider] = this._languageFeaturesService.linkProvider.ordered(model);
+			if (linkProvider) {
+				const linksList = await linkProvider.provideLinks(model, cts.token);
+				if (!cts.token.isCancellationRequested && linksList) {
+					for (const link of linksList.links) {
+						if (!link.url || typeof link.url === 'string') {
+							continue; // unresolved or plain-string URL — skip
+						}
+						const uri = link.url as URI;
+						if (!this._isLocalUri(uri)) {
+							continue;
+						}
+						const lineText = model.getLineContent(link.range.startLineNumber);
+						const name = _extractImportedName(lineText, uri);
+
+						if (!outgoingNames.includes(name)) {
+							outgoingNames.push(name);
+						}
+
+						// Store location for cmd-click. Prefer a class declaration position
+						// in the linked file if the model is already loaded; fall back to
+						// top-of-file so the editor at least opens at the right document.
+						if (!this._callNodeLocations.has(name)) {
+							let selectionRange: IRange = { startLineNumber: 1, startColumn: 1, endLineNumber: 1, endColumn: 1 };
+							const linkedModel = this._modelService.getModel(uri);
+							if (linkedModel) {
+								const [symProvider] = this._languageFeaturesService.documentSymbolProvider.ordered(linkedModel);
+								if (symProvider) {
+									const linkedSymbols = await symProvider.provideDocumentSymbols(linkedModel, cts.token) ?? [];
+									if (!cts.token.isCancellationRequested) {
+										const found =
+											linkedSymbols.find(s => s.name === name && (s.kind === SymbolKind.Class || s.kind === SymbolKind.Interface)) ??
+											linkedSymbols.find(s => s.kind === SymbolKind.Class || s.kind === SymbolKind.Interface);
+										if (found) {
+											selectionRange = found.selectionRange;
+										}
+									}
+								}
+							}
+							this._callNodeLocations.set(name, { uri, selectionRange });
+						}
+					}
+					linksList.dispose?.();
+				}
+			}
+			// else: no link provider registered — outgoing deps will be empty (graceful degradation)
+
+			if (cts.token.isCancellationRequested) {
+				return;
+			}
+
+			// ---- INCOMING: who imports this class? ------------------------------
+			const incomingNames: string[] = [];
+			const [refProvider] = this._languageFeaturesService.referenceProvider.ordered(model);
+			if (refProvider) {
+				const pos = new Position(position.lineNumber, position.column);
+				const refs = await refProvider.provideReferences(
+					model, pos, { includeDeclaration: false }, cts.token
+				) ?? [];
+
+				if (!cts.token.isCancellationRequested) {
+					for (const ref of refs) {
+						if (!this._isLocalUri(ref.uri)) {
+							continue;
+						}
+
+						// Determine whether this reference is on an import line.
+						// Prefer reading from an already-loaded model; fall back to
+						// treating the reference as an import (conservative).
+						const refModel = ref.uri.toString() === model.uri.toString()
+							? model
+							: this._modelService.getModel(ref.uri);
+
+						let isImport: boolean;
+						if (refModel) {
+							const lineText = refModel.getLineContent(ref.range.startLineNumber);
+							isImport = /\bimport\b/.test(lineText);
+						} else {
+							// Model not loaded — conservatively include as an importer.
+							isImport = true;
+						}
+
+						if (!isImport) {
+							continue;
+						}
+
+						// Use the importing file's basename as the node label.
+						// A more precise class name could be found via documentSymbolProvider
+						// on the importing file, but that requires the model to be loaded;
+						// the basename is always available and clearly identifies the module.
+						const name = _fileBasename(ref.uri);
+						if (!incomingNames.includes(name)) {
+							incomingNames.push(name);
+							if (!this._callNodeLocations.has(name)) {
+								this._callNodeLocations.set(name, {
+									uri: ref.uri,
+									selectionRange: {
+										startLineNumber: ref.range.startLineNumber,
+										startColumn: ref.range.startColumn,
+										endLineNumber: ref.range.startLineNumber,
+										endColumn: ref.range.endColumn,
+									},
+								});
+							}
+						}
+					}
+				}
+			}
+			// else: no reference provider registered — incoming deps will be empty (graceful degradation)
+
+			slot.renderContent({ callers: incomingNames, callees: outgoingNames });
 		};
 
 		doFetch().catch(() => {
@@ -1586,6 +1829,32 @@ export class ContextBubbleController extends Disposable {
 	}
 
 	// -------------------------------------------------------------------------
+	// Workspace URI filter — reused by both call graph and dependency graph
+	// -------------------------------------------------------------------------
+
+	/**
+	 * Returns true when `uri` falls under a workspace folder and is not a
+	 * type-declaration (.d.ts) or node_modules file. Used to exclude external
+	 * library symbols and type stubs from both function callees and class deps.
+	 */
+	private _isLocalUri(uri: URI): boolean {
+		const uriPath = uri.path;
+		if (uriPath.includes('/node_modules/') || uriPath.endsWith('.d.ts')) {
+			return false;
+		}
+		const workspaceFolders = this._workspaceContextService.getWorkspace().folders;
+		if (workspaceFolders.length === 0) {
+			return true; // no workspace configured — accept everything
+		}
+		const uriStr = uri.toString();
+		return workspaceFolders.some(f => {
+			const root = f.uri.toString();
+			const rootWithSlash = root.endsWith('/') ? root : root + '/';
+			return uriStr.startsWith(rootWithSlash) || uriStr === root;
+		});
+	}
+
+	// -------------------------------------------------------------------------
 	// Session teardown (only called on ×)
 	// -------------------------------------------------------------------------
 
@@ -1597,6 +1866,7 @@ export class ContextBubbleController extends Disposable {
 		this._slackChannels = [];
 		this._anchoredEditor = undefined;
 		this._currentSymbolName = '';
+		this._currentSymbolType = 'function';
 		this._currentModel = null;
 		this._currentPosition = null;
 		this._anchorSlot.value = undefined;
@@ -1604,7 +1874,7 @@ export class ContextBubbleController extends Disposable {
 		this._bubbleSlot.value = undefined;
 	}
 
-	private _navigateToNode(name: string): void {
+	private async _navigateToNode(name: string): Promise<void> {
 		const callGraphSlot = this._slotInstances.get('contextBubble.callGraph') as CallGraphSlot | undefined;
 
 		// Push the current call graph state onto the slot's history stack before
@@ -1618,11 +1888,12 @@ export class ContextBubbleController extends Disposable {
 		this._currentSymbolName = name;
 		callGraphSlot?.updateSymbol(name);
 
-		// Update model / position for the new symbol so _fetchCallGraph can query LSP.
+		// Best-effort model / position update before the async open completes.
+		// Will be refined after openEditor resolves in class mode.
 		if (loc) {
-			const newModel = this._modelService.getModel(loc.uri);
-			if (newModel) {
-				this._currentModel = newModel;
+			const existingModel = this._modelService.getModel(loc.uri);
+			if (existingModel) {
+				this._currentModel = existingModel;
 			}
 			this._currentPosition = {
 				lineNumber: loc.selectionRange.startLineNumber,
@@ -1645,12 +1916,61 @@ export class ContextBubbleController extends Disposable {
 		// Clear the location cache — it belongs to the previous symbol.
 		this._callNodeLocations.clear();
 
-		// Open the editor at the target symbol's location.
+		// Open the editor at the target symbol's location.  Awaiting ensures the
+		// model is loaded before we fetch data — critical for class mode where the
+		// target file may not have been open previously.
 		if (loc) {
-			this._editorService.openEditor({
-				resource: loc.uri,
-				options: { selection: loc.selectionRange, revealIfOpened: true },
-			});
+			try {
+				await this._editorService.openEditor({
+					resource: loc.uri,
+					options: { selection: loc.selectionRange, revealIfOpened: true },
+				});
+			} catch {
+				// Ignore open errors — fetch will degrade gracefully without a model.
+			}
+
+			// After the editor is open the model should now be available.
+			const openedModel = this._modelService.getModel(loc.uri);
+			if (openedModel) {
+				this._currentModel = openedModel;
+			}
+
+			// For class mode: the stored location may point to the import line of
+			// an incoming dep or top-of-file for an outgoing dep. Run a quick
+			// DocumentSymbolProvider pass to find the actual class declaration in
+			// the opened file so that _fetchDependencyGraph receives an accurate
+			// position and _currentSymbolName matches the class name in that file.
+			if (this._currentSymbolType === 'class' && openedModel) {
+				const cts = new CancellationTokenSource();
+				try {
+					const [symProvider] = this._languageFeaturesService.documentSymbolProvider.ordered(openedModel);
+					if (symProvider) {
+						const syms = await symProvider.provideDocumentSymbols(openedModel, cts.token) ?? [];
+						if (!cts.token.isCancellationRequested) {
+							// Prefer a class/interface whose name matches the navigated node;
+							// fall back to the first class/interface in the file.
+							const exact = syms.find(s =>
+								s.name === name &&
+								(s.kind === SymbolKind.Class || s.kind === SymbolKind.Interface)
+							);
+							const first = syms.find(s =>
+								s.kind === SymbolKind.Class || s.kind === SymbolKind.Interface
+							);
+							const found = exact ?? first;
+							if (found) {
+								this._currentSymbolName = found.name;
+								callGraphSlot?.updateSymbol(found.name);
+								this._currentPosition = {
+									lineNumber: found.selectionRange.startLineNumber,
+									column: found.selectionRange.startColumn,
+								};
+							}
+						}
+					}
+				} finally {
+					cts.dispose(true);
+				}
+			}
 		} else {
 			const model = this._currentModel;
 			const editor = this._anchoredEditor;
@@ -1677,6 +1997,8 @@ export class ContextBubbleController extends Disposable {
 		symbolName: string;
 		model: ITextModel | null;
 		position: IPosition;
+		/** Fast regex-based type hint — overridden by the async LSP check later. */
+		symbolTypeHint: 'function' | 'class';
 	} | undefined {
 		const editor = this._codeEditorService.getFocusedCodeEditor()
 			?? this._codeEditorService.getActiveCodeEditor();
@@ -1696,9 +2018,15 @@ export class ContextBubbleController extends Disposable {
 			? _resolveSymbolFromSelection(model, selection.startLineNumber, selection.endLineNumber)
 			: { symbolName: 'symbol', position: selection.getStartPosition() };
 
+		// Quick regex hint: check whether the declaration line contains `class`.
+		// The async DocumentSymbolProvider check in _checkPartialSelectionAndMaybeTrigger
+		// will override this with the authoritative LSP kind.
+		const firstHeaderLine = model?.getLineContent(selection.startLineNumber) ?? '';
+		const symbolTypeHint: 'function' | 'class' = /\bclass\b/.test(firstHeaderLine) ? 'class' : 'function';
+
 		return {
 			editor,
-			// Fix 1: anchor is placed at the END of the selection, not the start.
+			// Anchor is placed at the END of the selection, not the start.
 			lineNumber: selection.endLineNumber,
 			selectionRange: {
 				startLineNumber: selection.startLineNumber,
@@ -1709,6 +2037,7 @@ export class ContextBubbleController extends Disposable {
 			symbolName,
 			model,
 			position,
+			symbolTypeHint,
 		};
 	}
 

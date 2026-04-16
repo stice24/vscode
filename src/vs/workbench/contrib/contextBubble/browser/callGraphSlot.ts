@@ -102,11 +102,17 @@ function ensureCallGraphStyles(): void {
 // Types
 // ---------------------------------------------------------------------------
 
-/** Data shape for the call graph slot. */
+/** Data shape for the call graph / dependency slot. */
 export interface CallGraphData {
-	/** Names of functions that call the centre symbol. */
+	/**
+	 * For function mode: names of functions that call the centre symbol.
+	 * For class mode: names of files/classes that import this class (incoming deps).
+	 */
 	callers: string[];
-	/** Names of functions the centre symbol calls. */
+	/**
+	 * For function mode: names of functions the centre symbol calls.
+	 * For class mode: names of imported classes/modules this class depends on (outgoing deps).
+	 */
 	callees: string[];
 }
 
@@ -164,14 +170,20 @@ function truncate(name: string, maxLen: number): string {
 // ---------------------------------------------------------------------------
 
 /**
- * Slot 1 — Call Graph.
+ * Slot 1 — Call Graph (function mode) or Dependencies (class mode).
  *
- * Renders a directed node graph: callers branch in from the left, the
- * highlighted symbol sits in the centre, callees branch out to the right.
+ * Function mode: renders callers on the left, the highlighted function in the
+ * centre, callees on the right. Uses CallHierarchyProvider data.
+ *
+ * Class mode: renders importers (incoming deps) on the left, the highlighted
+ * class in the centre, imported classes/modules (outgoing deps) on the right.
+ * Uses LinkProvider + ReferenceProvider data.
  *
  * Cmd-click on any node navigates the bubble to that symbol and pushes the
  * current view onto a history stack. A compact history bar appears at the
  * bottom of the slot when history depth > 0, providing back/forward navigation.
+ * History navigation preserves the symbol type — a class bubble stays in class
+ * mode throughout its navigation chain.
  */
 export class CallGraphSlot extends SlotComponent {
 
@@ -183,6 +195,8 @@ export class CallGraphSlot extends SlotComponent {
 	readonly onNodeCmdClick = this._cmdClickEmitter.event;
 
 	private _symbolName: string;
+	/** Invariant within a session — set at construction, never changes during navigation. */
+	private readonly _symbolType: 'function' | 'class';
 
 	// ---- History state (local to this slot instance / session) --------------
 
@@ -197,9 +211,10 @@ export class CallGraphSlot extends SlotComponent {
 	/** Currently visible tooltip element, if any. */
 	private _activeTooltip: SVGGElement | null = null;
 
-	constructor(container: HTMLElement, symbolName: string) {
-		super(container, 'Call Graph');
+	constructor(container: HTMLElement, symbolName: string, symbolType: 'function' | 'class' = 'function') {
+		super(container, symbolType === 'class' ? 'Dependencies' : 'Call Graph');
 		this._symbolName = symbolName || 'symbol';
+		this._symbolType = symbolType;
 		ensureCallGraphStyles();
 	}
 
@@ -402,7 +417,7 @@ export class CallGraphSlot extends SlotComponent {
 		svg.appendChild(edgeLayer);
 		svg.appendChild(nodeLayer);
 
-		// Callers
+		// Callers (function mode) / Importers (class mode)
 		if (useCallerList) {
 			this._appendListNode(edgeLayer, nodeLayer, callers, { x: callerX, y: vh / 2 }, center, centerR, true, vh);
 		} else {
@@ -412,11 +427,12 @@ export class CallGraphSlot extends SlotComponent {
 				this._appendNode(nodeLayer, tooltipLayer, pos, nodeR, name, false);
 			});
 			if (callers.length === 0) {
-				this._appendEmptyLabel(nodeLayer, callerX, vh / 2, 'no callers');
+				const emptyLabel = this._symbolType === 'class' ? 'no importers' : 'no callers';
+				this._appendEmptyLabel(nodeLayer, callerX, vh / 2, emptyLabel);
 			}
 		}
 
-		// Callees
+		// Callees (function mode) / Outgoing imports (class mode)
 		if (useCalleeList) {
 			this._appendListNode(edgeLayer, nodeLayer, callees, { x: calleeX, y: vh / 2 }, center, centerR, false, vh);
 		} else {
@@ -426,7 +442,8 @@ export class CallGraphSlot extends SlotComponent {
 				this._appendNode(nodeLayer, tooltipLayer, pos, nodeR, name, false);
 			});
 			if (callees.length === 0) {
-				this._appendEmptyLabel(nodeLayer, calleeX, vh / 2, 'no project callees');
+				const emptyLabel = this._symbolType === 'class' ? 'no imports' : 'no project callees';
+				this._appendEmptyLabel(nodeLayer, calleeX, vh / 2, emptyLabel);
 			}
 		}
 
@@ -621,7 +638,9 @@ export class CallGraphSlot extends SlotComponent {
 		countLabel.setAttribute('fill', 'rgba(160, 185, 205, 0.7)');
 		countLabel.setAttribute('font-size', '6');
 		countLabel.setAttribute('font-family', 'system-ui, -apple-system, sans-serif');
-		countLabel.textContent = `${names.length} ${isCallers ? 'callers' : 'callees'}`;
+		const callerWord = this._symbolType === 'class' ? 'importers' : 'callers';
+		const calleeWord = this._symbolType === 'class' ? 'imports' : 'callees';
+		countLabel.textContent = `${names.length} ${isCallers ? callerWord : calleeWord}`;
 		nodeLayer.appendChild(countLabel);
 
 		// Scrollable list via foreignObject
