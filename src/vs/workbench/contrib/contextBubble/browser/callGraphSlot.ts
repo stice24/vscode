@@ -116,11 +116,6 @@ export interface CallGraphData {
 	callees: string[];
 }
 
-/** One entry in the navigation history stack. */
-interface IHistoryEntry {
-	symbolName: string;
-	data: CallGraphData;
-}
 
 // ---------------------------------------------------------------------------
 // Mock data — replace with LSP results in session 5
@@ -198,13 +193,19 @@ export class CallGraphSlot extends SlotComponent {
 	/** Invariant within a session — set at construction, never changes during navigation. */
 	private readonly _symbolType: 'function' | 'class';
 
-	// ---- History state (local to this slot instance / session) --------------
+	// ---- History events — navigation is managed by the controller ----------
 
-	private _backStack: IHistoryEntry[] = [];
-	private _forwardStack: IHistoryEntry[] = [];
+	private readonly _backBtnEmitter = this._register(new Emitter<void>());
+	/** Fired when the user clicks the ← button in the history bar. */
+	readonly onBackBtnClicked = this._backBtnEmitter.event;
+
+	private readonly _fwdBtnEmitter = this._register(new Emitter<void>());
+	/** Fired when the user clicks the → button in the history bar. */
+	readonly onForwardBtnClicked = this._fwdBtnEmitter.event;
+
 	/** The data from the most recent successful renderContent call. */
 	private _lastRenderedData: CallGraphData | null = null;
-	/** The history bar DOM element, present only when backStack.length > 0. */
+	/** The history bar DOM element, present only when the controller shows it. */
 	private _historyBarEl: HTMLElement | null = null;
 	/** Direct reference to the rendered SVG element, avoids querySelector. */
 	private _svgEl: SVGSVGElement | null = null;
@@ -231,20 +232,49 @@ export class CallGraphSlot extends SlotComponent {
 		this._symbolName = name;
 	}
 
+	/** Returns the data from the most recent renderContent() call, or null. */
+	getLastRenderedData(): CallGraphData | null {
+		return this._lastRenderedData;
+	}
+
 	/**
-	 * Saves the current symbol + graph data onto the back stack and clears the
-	 * forward stack. Called by the controller just before re-fetching for a new
-	 * symbol (i.e. when the user cmd-clicks a node).
-	 *
-	 * No-op if no data has been rendered yet.
+	 * Updates the history bar's visibility and button states.
+	 * Called by the controller whenever the navigation stack changes.
+	 * Passing (false, false) hides the bar entirely.
 	 */
-	pushCurrentToHistory(): void {
-		if (this._lastRenderedData === null) {
+	updateHistoryBar(canGoBack: boolean, canGoForward: boolean): void {
+		this._historyBarEl?.remove();
+		this._historyBarEl = null;
+
+		if (!canGoBack && !canGoForward) {
 			return;
 		}
-		this._backStack.push({ symbolName: this._symbolName, data: this._lastRenderedData });
-		this._forwardStack = [];
-		// Bar will be updated by the next renderContent() call.
+
+		const bar = document.createElement('div');
+		bar.className = 'call-graph-history-bar';
+
+		const backBtn = document.createElement('button');
+		backBtn.className = 'call-graph-history-btn';
+		backBtn.textContent = '\u2190'; // ←
+		backBtn.disabled = !canGoBack;
+		backBtn.addEventListener('click', () => this._backBtnEmitter.fire());
+
+		const label = document.createElement('span');
+		label.className = 'call-graph-history-label';
+		label.textContent = this._symbolName;
+
+		const fwdBtn = document.createElement('button');
+		fwdBtn.className = 'call-graph-history-btn';
+		fwdBtn.textContent = '\u2192'; // →
+		fwdBtn.disabled = !canGoForward;
+		fwdBtn.addEventListener('click', () => this._fwdBtnEmitter.fire());
+
+		bar.appendChild(backBtn);
+		bar.appendChild(label);
+		bar.appendChild(fwdBtn);
+
+		this._historyBarEl = bar;
+		this.element.appendChild(bar);
 	}
 
 	// -------------------------------------------------------------------------
@@ -255,17 +285,16 @@ export class CallGraphSlot extends SlotComponent {
 		const { callers, callees } = data as CallGraphData;
 		this._lastRenderedData = { callers, callees };
 
-		// Clear any existing graph before rendering fresh content. This handles
-		// both the initial render and re-navigation renders correctly.
+		// Clear any existing graph before rendering fresh content.
 		this._clearGraph();
 
 		this.setState('success');
 		this._renderGraph(callers, callees);
-		this._updateHistoryBar();
+		// History bar is managed externally by the controller via updateHistoryBar().
 	}
 
 	// -------------------------------------------------------------------------
-	// Internal graph / history helpers
+	// Internal graph helpers
 	// -------------------------------------------------------------------------
 
 	/** Removes the SVG graph element from the slot DOM and resets tooltip state. */
@@ -273,83 +302,6 @@ export class CallGraphSlot extends SlotComponent {
 		this._activeTooltip = null;
 		this._svgEl?.remove();
 		this._svgEl = null;
-	}
-
-	/**
-	 * Rebuilds the history bar based on current stack state.
-	 * Removes any existing bar and re-creates it if history depth > 0.
-	 */
-	private _updateHistoryBar(): void {
-		this._historyBarEl?.remove();
-		this._historyBarEl = null;
-
-		if (this._backStack.length === 0) {
-			return;
-		}
-
-		const bar = document.createElement('div');
-		bar.className = 'call-graph-history-bar';
-
-		const backBtn = document.createElement('button');
-		backBtn.className = 'call-graph-history-btn';
-		backBtn.textContent = '\u2190'; // ←
-		backBtn.disabled = false;
-		backBtn.addEventListener('click', () => this._onBackClicked());
-
-		const label = document.createElement('span');
-		label.className = 'call-graph-history-label';
-		label.textContent = this._symbolName;
-
-		const fwdBtn = document.createElement('button');
-		fwdBtn.className = 'call-graph-history-btn';
-		fwdBtn.textContent = '\u2192'; // →
-		fwdBtn.disabled = this._forwardStack.length === 0;
-		fwdBtn.addEventListener('click', () => this._onForwardClicked());
-
-		bar.appendChild(backBtn);
-		bar.appendChild(label);
-		bar.appendChild(fwdBtn);
-
-		this._historyBarEl = bar;
-		this.element.appendChild(bar);
-	}
-
-	private _onBackClicked(): void {
-		const entry = this._backStack.pop();
-		if (!entry || this._lastRenderedData === null) {
-			return;
-		}
-
-		// Push current state onto the forward stack so the user can go forward again.
-		this._forwardStack.push({ symbolName: this._symbolName, data: this._lastRenderedData });
-
-		// Restore previous state.
-		this._symbolName = entry.symbolName;
-		this._lastRenderedData = entry.data;
-
-		this._clearGraph();
-		this.setState('success');
-		this._renderGraph(entry.data.callers, entry.data.callees);
-		this._updateHistoryBar();
-	}
-
-	private _onForwardClicked(): void {
-		const entry = this._forwardStack.pop();
-		if (!entry || this._lastRenderedData === null) {
-			return;
-		}
-
-		// Push current state onto the back stack.
-		this._backStack.push({ symbolName: this._symbolName, data: this._lastRenderedData });
-
-		// Restore forward state.
-		this._symbolName = entry.symbolName;
-		this._lastRenderedData = entry.data;
-
-		this._clearGraph();
-		this.setState('success');
-		this._renderGraph(entry.data.callers, entry.data.callees);
-		this._updateHistoryBar();
 	}
 
 	// -------------------------------------------------------------------------
@@ -427,7 +379,7 @@ export class CallGraphSlot extends SlotComponent {
 				this._appendNode(nodeLayer, tooltipLayer, pos, nodeR, name, false);
 			});
 			if (callers.length === 0) {
-				const emptyLabel = this._symbolType === 'class' ? 'no importers' : 'no callers';
+				const emptyLabel = this._symbolType === 'class' ? 'no exports' : 'no callers';
 				this._appendEmptyLabel(nodeLayer, callerX, vh / 2, emptyLabel);
 			}
 		}
@@ -454,7 +406,12 @@ export class CallGraphSlot extends SlotComponent {
 		svg.appendChild(tooltipLayer);
 
 		this._svgEl = svg;
-		this.element.appendChild(svg);
+		// Insert before the history bar so the bar always stays at the bottom.
+		if (this._historyBarEl) {
+			this.element.insertBefore(svg, this._historyBarEl);
+		} else {
+			this.element.appendChild(svg);
+		}
 	}
 
 	private _appendEmptyLabel(parent: SVGGElement, x: number, y: number, text: string): void {
@@ -638,7 +595,7 @@ export class CallGraphSlot extends SlotComponent {
 		countLabel.setAttribute('fill', 'rgba(160, 185, 205, 0.7)');
 		countLabel.setAttribute('font-size', '6');
 		countLabel.setAttribute('font-family', 'system-ui, -apple-system, sans-serif');
-		const callerWord = this._symbolType === 'class' ? 'importers' : 'callers';
+		const callerWord = this._symbolType === 'class' ? 'exports' : 'callers';
 		const calleeWord = this._symbolType === 'class' ? 'imports' : 'callees';
 		countLabel.textContent = `${names.length} ${isCallers ? callerWord : calleeWord}`;
 		nodeLayer.appendChild(countLabel);

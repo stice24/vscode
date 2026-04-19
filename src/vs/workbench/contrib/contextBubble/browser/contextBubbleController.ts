@@ -30,7 +30,7 @@ import {
 	ISlotConfig, DEFAULT_SLOT_CONFIG, SlotSourceId, SlotPositionKey,
 	SLOT_POSITION_KEYS,
 } from './slotComponent.js';
-import { CallGraphSlot } from './callGraphSlot.js';
+import { CallGraphSlot, CallGraphData } from './callGraphSlot.js';
 import { GitHistorySlot, CommitEntry } from './gitHistorySlot.js';
 import { SlackMentionsSlot, SlackMessage } from './slackMentionsSlot.js';
 import { SlotConfigOverlay } from './slotConfigOverlay.js';
@@ -41,6 +41,7 @@ import { IOpenerService } from '../../../../platform/opener/common/opener.js';
 import { INativeHostService } from '../../../../platform/native/common/native.js';
 import { INotificationService, Severity } from '../../../../platform/notification/common/notification.js';
 import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js';
+import { IFileService } from '../../../../platform/files/common/files.js';
 
 export const CONTEXT_BUBBLE_COMMAND_ID = 'contextBubble.trigger';
 
@@ -537,6 +538,15 @@ export class ContextBubbleController extends Disposable {
 	 */
 	private readonly _slotInstances = new Map<SlotSourceId, SlotComponent>();
 
+	/**
+	 * Navigation history for back/forward traversal of call-graph nodes.
+	 * Each entry captures the full controller state needed to restore a previous
+	 * symbol: its name, cached graph data, source file URI, and cursor position.
+	 * Managed in sync with the visual history bar in CallGraphSlot.
+	 */
+	private _navBackStack: Array<{ symbolName: string; data: CallGraphData; uri: string; lineNumber: number; column: number }> = [];
+	private _navForwardStack: Array<{ symbolName: string; data: CallGraphData; uri: string; lineNumber: number; column: number }> = [];
+
 	/** Slack user token loaded from secret storage. Cached for the session lifetime. */
 	private _slackToken: string | undefined;
 
@@ -560,6 +570,7 @@ export class ContextBubbleController extends Disposable {
 		@IOpenerService private readonly _openerService: IOpenerService,
 		@INotificationService private readonly _notificationService: INotificationService,
 		@IWorkspaceContextService private readonly _workspaceContextService: IWorkspaceContextService,
+		@IFileService private readonly _fileService: IFileService,
 	) {
 		super();
 		this._register(CommandsRegistry.registerCommand(CONTEXT_BUBBLE_COMMAND_ID, () => {
@@ -857,12 +868,17 @@ export class ContextBubbleController extends Disposable {
 		// Position slots according to saved config
 		this._applyLayout(bubble, config);
 
-		// Wire cmd-click navigation from the call graph slot.
-		// callGraphSlot is already declared above; read from _slotInstances via cast.
+		// Wire call-graph interactions from the slot.
 		this._callNodeLocations.clear();
 		if (callGraphSlot) {
 			this._sessionDisposables.add(
 				callGraphSlot.onNodeCmdClick(name => this._navigateToNode(name))
+			);
+			this._sessionDisposables.add(
+				callGraphSlot.onBackBtnClicked(() => this._historyBack())
+			);
+			this._sessionDisposables.add(
+				callGraphSlot.onForwardBtnClicked(() => this._historyForward())
 			);
 		}
 
@@ -1048,53 +1064,103 @@ export class ContextBubbleController extends Disposable {
 
 		const doFetch = async () => {
 			// ---- OUTGOING: what does this class import? -------------------------
+			// The built-in link provider only detects URL literals (http://, file://)
+			// and does NOT resolve TypeScript module specifiers. Scan import lines
+			// directly from the model text instead — reliable in all LSP modes.
+			// Only relative paths (./  ../) are collected; bare specifiers like
+			// 'react' or '@company/pkg' are node_modules and excluded by design.
+			const IMPORT_SCAN_LINES = 100;
 			const outgoingNames: string[] = [];
-			const [linkProvider] = this._languageFeaturesService.linkProvider.ordered(model);
-			if (linkProvider) {
-				const linksList = await linkProvider.provideLinks(model, cts.token);
-				if (!cts.token.isCancellationRequested && linksList) {
-					for (const link of linksList.links) {
-						if (!link.url || typeof link.url === 'string') {
-							continue; // unresolved or plain-string URL — skip
-						}
-						const uri = link.url as URI;
-						if (!this._isLocalUri(uri)) {
-							continue;
-						}
-						const lineText = model.getLineContent(link.range.startLineNumber);
-						const name = _extractImportedName(lineText, uri);
+			// Matches the module path in:  from './x'  |  from "../x"  |  require('./x')
+			const relImportRe = /(?:from|require\s*\()\s*['"](\.[^'"]+)['"]/;
 
-						if (!outgoingNames.includes(name)) {
-							outgoingNames.push(name);
-						}
+			for (let ln = 1; ln <= Math.min(model.getLineCount(), IMPORT_SCAN_LINES); ln++) {
+				if (cts.token.isCancellationRequested) { return; }
+				const lineText = model.getLineContent(ln);
+				const pathMatch = relImportRe.exec(lineText);
+				if (!pathMatch) { continue; }
 
-						// Store location for cmd-click. Prefer a class declaration position
-						// in the linked file if the model is already loaded; fall back to
-						// top-of-file so the editor at least opens at the right document.
-						if (!this._callNodeLocations.has(name)) {
-							let selectionRange: IRange = { startLineNumber: 1, startColumn: 1, endLineNumber: 1, endColumn: 1 };
-							const linkedModel = this._modelService.getModel(uri);
-							if (linkedModel) {
-								const [symProvider] = this._languageFeaturesService.documentSymbolProvider.ordered(linkedModel);
-								if (symProvider) {
-									const linkedSymbols = await symProvider.provideDocumentSymbols(linkedModel, cts.token) ?? [];
-									if (!cts.token.isCancellationRequested) {
-										const found =
-											linkedSymbols.find(s => s.name === name && (s.kind === SymbolKind.Class || s.kind === SymbolKind.Interface)) ??
-											linkedSymbols.find(s => s.kind === SymbolKind.Class || s.kind === SymbolKind.Interface);
-										if (found) {
-											selectionRange = found.selectionRange;
-										}
-									}
+				const relPath = pathMatch[1];
+
+				// Resolve the relative path to an absolute URI.
+				// URI.joinPath uses posix.join semantics, so '..' is normalised correctly.
+				//
+				// IMPORTANT: Code OSS (TypeScript ESM style) writes `import './foo.js'`
+				// while the actual file on disk is `foo.ts`. We must NEVER pass the stated
+				// extension directly — always build a candidate list, prefer .ts over .js,
+				// and confirm existence before using the URI.
+				const hasExtension = /\.(ts|tsx|js|jsx|mjs|cjs|json)$/.test(relPath);
+				const base = URI.joinPath(model.uri, '..', relPath);
+				const candidates: URI[] = [];
+				if (hasExtension) {
+					// Prefer the TypeScript source over any stated .js/.jsx extension.
+					const tsPath = base.path.replace(/\.js$/, '.ts').replace(/\.jsx$/, '.tsx');
+					if (tsPath !== base.path) {
+						candidates.push(base.with({ path: tsPath })); // .ts/.tsx first
+					}
+					candidates.push(base); // stated extension as fallback
+				} else {
+					// No extension — try common TypeScript/JavaScript suffixes, then index files.
+					candidates.push(
+						base.with({ path: base.path + '.ts' }),
+						base.with({ path: base.path + '.tsx' }),
+						base.with({ path: base.path + '.js' }),
+						base.with({ path: base.path + '.jsx' }),
+						URI.joinPath(base, 'index.ts'),
+						URI.joinPath(base, 'index.tsx'),
+					);
+				}
+				// 1. Check already-loaded models first (free, synchronous).
+				// 2. Fall back to parallel IFileService.exists() checks.
+				let resolvedUri: URI | undefined;
+				for (const cand of candidates) {
+					if (this._modelService.getModel(cand)) {
+						resolvedUri = cand;
+						break;
+					}
+				}
+				if (!resolvedUri) {
+					const existsResults = await Promise.all(
+						candidates.map(c => this._fileService.exists(c).catch(() => false))
+					);
+					const idx = existsResults.findIndex(Boolean);
+					resolvedUri = idx >= 0 ? candidates[idx] : undefined;
+				}
+				// Skip if we couldn't resolve a real file path
+				if (!resolvedUri) { continue; }
+
+				if (!this._isLocalUri(resolvedUri)) {
+					continue;
+				}
+
+				const name = _extractImportedName(lineText, resolvedUri);
+				if (!outgoingNames.includes(name)) {
+					outgoingNames.push(name);
+				}
+
+				// Store location for cmd-click. Prefer a class declaration position
+				// in the linked file if the model is already loaded; fall back to
+				// top-of-file so the editor at least opens at the right document.
+				if (!this._callNodeLocations.has(name)) {
+					let selectionRange: IRange = { startLineNumber: 1, startColumn: 1, endLineNumber: 1, endColumn: 1 };
+					const linkedModel = this._modelService.getModel(resolvedUri);
+					if (linkedModel) {
+						const [symProvider] = this._languageFeaturesService.documentSymbolProvider.ordered(linkedModel);
+						if (symProvider) {
+							const linkedSymbols = await symProvider.provideDocumentSymbols(linkedModel, cts.token) ?? [];
+							if (!cts.token.isCancellationRequested) {
+								const found =
+									linkedSymbols.find(s => s.name === name && (s.kind === SymbolKind.Class || s.kind === SymbolKind.Interface)) ??
+									linkedSymbols.find(s => s.kind === SymbolKind.Class || s.kind === SymbolKind.Interface);
+								if (found) {
+									selectionRange = found.selectionRange;
 								}
 							}
-							this._callNodeLocations.set(name, { uri, selectionRange });
 						}
 					}
-					linksList.dispose?.();
+					this._callNodeLocations.set(name, { uri: resolvedUri, selectionRange });
 				}
 			}
-			// else: no link provider registered — outgoing deps will be empty (graceful degradation)
 
 			if (cts.token.isCancellationRequested) {
 				return;
@@ -1862,6 +1928,8 @@ export class ContextBubbleController extends Disposable {
 		this._sessionDisposables.clear();
 		this._slotInstances.clear();
 		this._callNodeLocations.clear();
+		this._navBackStack = [];
+		this._navForwardStack = [];
 		this._slackToken = undefined;
 		this._slackChannels = [];
 		this._anchoredEditor = undefined;
@@ -1877,9 +1945,21 @@ export class ContextBubbleController extends Disposable {
 	private async _navigateToNode(name: string): Promise<void> {
 		const callGraphSlot = this._slotInstances.get('contextBubble.callGraph') as CallGraphSlot | undefined;
 
-		// Push the current call graph state onto the slot's history stack before
-		// changing any controller state, so the saved entry reflects the current symbol.
-		callGraphSlot?.pushCurrentToHistory();
+		// Snapshot current state onto the back stack before changing anything so the
+		// saved entry reflects the symbol we're navigating AWAY from.
+		const currentData = callGraphSlot?.getLastRenderedData();
+		if (currentData && this._currentModel && this._currentPosition) {
+			this._navBackStack.push({
+				symbolName: this._currentSymbolName,
+				data: currentData,
+				uri: this._currentModel.uri.toString(),
+				lineNumber: this._currentPosition.lineNumber,
+				column: this._currentPosition.column,
+			});
+			this._navForwardStack = [];
+			// Show the history bar immediately — the slot will re-render shortly.
+			callGraphSlot?.updateHistoryBar(true, false);
+		}
 
 		const loc = this._callNodeLocations.get(name);
 
@@ -1982,6 +2062,146 @@ export class ContextBubbleController extends Disposable {
 
 		// Re-trigger the full bubble data load for the new symbol.
 		this._fetchCallGraph();
+		this._fetchGitHistory();
+		this._fetchSlackMentions();
+	}
+
+	// -------------------------------------------------------------------------
+	// History navigation — back / forward
+	// -------------------------------------------------------------------------
+
+	/**
+	 * Restores the previous symbol in the navigation history.
+	 * Mirrors what _navigateToNode does for cmd-click but in reverse:
+	 * re-renders the call graph from cached data, navigates the editor back to
+	 * the previous symbol's location, and re-fetches git history + Slack.
+	 */
+	private async _historyBack(): Promise<void> {
+		if (this._navBackStack.length === 0) {
+			return;
+		}
+
+		const callGraphSlot = this._slotInstances.get('contextBubble.callGraph') as CallGraphSlot | undefined;
+
+		// Save current state onto the forward stack so the user can go forward again.
+		const currentData = callGraphSlot?.getLastRenderedData();
+		this._navForwardStack.push({
+			symbolName: this._currentSymbolName,
+			data: currentData ?? { callers: [], callees: [] },
+			uri: this._currentModel?.uri.toString() ?? '',
+			lineNumber: this._currentPosition?.lineNumber ?? 1,
+			column: this._currentPosition?.column ?? 1,
+		});
+
+		// Pop and restore the previous state.
+		const entry = this._navBackStack.pop()!;
+		this._currentSymbolName = entry.symbolName;
+		callGraphSlot?.updateSymbol(entry.symbolName);
+		this._currentPosition = { lineNumber: entry.lineNumber, column: entry.column };
+
+		const targetUri = URI.parse(entry.uri);
+		const existingModel = this._modelService.getModel(targetUri);
+		if (existingModel) {
+			this._currentModel = existingModel;
+		}
+
+		// Re-render call graph from cached data — no LSP fetch needed.
+		callGraphSlot?.renderContent(entry.data);
+		callGraphSlot?.updateHistoryBar(
+			this._navBackStack.length > 0,
+			this._navForwardStack.length > 0,
+		);
+
+		// Navigate the editor to the restored symbol's location.
+		try {
+			await this._editorService.openEditor({
+				resource: targetUri,
+				options: {
+					selection: {
+						startLineNumber: entry.lineNumber,
+						startColumn: entry.column,
+						endLineNumber: entry.lineNumber,
+						endColumn: entry.column,
+					},
+					revealIfOpened: true,
+				},
+			});
+			const openedModel = this._modelService.getModel(targetUri);
+			if (openedModel) {
+				this._currentModel = openedModel;
+			}
+		} catch {
+			// Ignore navigation errors — git/Slack re-fetch will still work.
+		}
+
+		// Re-fetch the two data-dependent slots for the restored symbol.
+		this._fetchGitHistory();
+		this._fetchSlackMentions();
+	}
+
+	/**
+	 * Advances to the next symbol in the navigation history (undoes a back step).
+	 * Symmetric to _historyBack.
+	 */
+	private async _historyForward(): Promise<void> {
+		if (this._navForwardStack.length === 0) {
+			return;
+		}
+
+		const callGraphSlot = this._slotInstances.get('contextBubble.callGraph') as CallGraphSlot | undefined;
+
+		// Save current state onto the back stack.
+		const currentData = callGraphSlot?.getLastRenderedData();
+		this._navBackStack.push({
+			symbolName: this._currentSymbolName,
+			data: currentData ?? { callers: [], callees: [] },
+			uri: this._currentModel?.uri.toString() ?? '',
+			lineNumber: this._currentPosition?.lineNumber ?? 1,
+			column: this._currentPosition?.column ?? 1,
+		});
+
+		// Pop and restore the forward state.
+		const entry = this._navForwardStack.pop()!;
+		this._currentSymbolName = entry.symbolName;
+		callGraphSlot?.updateSymbol(entry.symbolName);
+		this._currentPosition = { lineNumber: entry.lineNumber, column: entry.column };
+
+		const targetUri = URI.parse(entry.uri);
+		const existingModel = this._modelService.getModel(targetUri);
+		if (existingModel) {
+			this._currentModel = existingModel;
+		}
+
+		// Re-render call graph from cached data — no LSP fetch needed.
+		callGraphSlot?.renderContent(entry.data);
+		callGraphSlot?.updateHistoryBar(
+			this._navBackStack.length > 0,
+			this._navForwardStack.length > 0,
+		);
+
+		// Navigate the editor to the restored symbol's location.
+		try {
+			await this._editorService.openEditor({
+				resource: targetUri,
+				options: {
+					selection: {
+						startLineNumber: entry.lineNumber,
+						startColumn: entry.column,
+						endLineNumber: entry.lineNumber,
+						endColumn: entry.column,
+					},
+					revealIfOpened: true,
+				},
+			});
+			const openedModel = this._modelService.getModel(targetUri);
+			if (openedModel) {
+				this._currentModel = openedModel;
+			}
+		} catch {
+			// Ignore navigation errors.
+		}
+
+		// Re-fetch the two data-dependent slots for the restored symbol.
 		this._fetchGitHistory();
 		this._fetchSlackMentions();
 	}
