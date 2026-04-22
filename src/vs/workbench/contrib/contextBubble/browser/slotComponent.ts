@@ -211,6 +211,11 @@ export abstract class SlotComponent extends Disposable {
 	 */
 	abstract renderContent(data: unknown): void;
 
+	/** Returns a markdown summary of the slot's current data for sending to Copilot. */
+	getContextSummary(): string {
+		return '';
+	}
+
 	override dispose(): void {
 		this.element.remove();
 		super.dispose();
