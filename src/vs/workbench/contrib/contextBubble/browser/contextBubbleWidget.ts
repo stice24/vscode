@@ -212,6 +212,48 @@ function ensureWidgetStyles(): void {
 	border-bottom: 1px solid rgba(80, 200, 220, 0.1);
 }
 
+/* ---- Send to Copilot button in chrome ---- */
+.context-bubble-btn-send {
+	background: none;
+	border: none;
+	cursor: pointer;
+	color: rgba(80, 200, 220, 0.9);
+	font-size: 13px;
+	line-height: 1;
+	padding: 2px 5px;
+	border-radius: 3px;
+	opacity: 0.5;
+	transition: opacity 0.15s, background 0.1s;
+}
+.context-bubble-widget.is-hovered .context-bubble-btn-send {
+	opacity: 0.85;
+}
+.context-bubble-btn-send:hover {
+	opacity: 1 !important;
+	background: rgba(80, 200, 220, 0.15);
+}
+
+/* ---- Copy to clipboard button in chrome ---- */
+.context-bubble-btn-copy {
+	background: none;
+	border: none;
+	cursor: pointer;
+	color: rgba(80, 200, 220, 0.9);
+	font-size: 13px;
+	line-height: 1;
+	padding: 2px 5px;
+	border-radius: 3px;
+	opacity: 0.5;
+	transition: opacity 0.15s, background 0.1s;
+}
+.context-bubble-widget.is-hovered .context-bubble-btn-copy {
+	opacity: 0.85;
+}
+.context-bubble-btn-copy:hover {
+	opacity: 1 !important;
+	background: rgba(80, 200, 220, 0.15);
+}
+
 /* ---- Config button in chrome ---- */
 .context-bubble-btn-config {
 	background: none;
@@ -284,7 +326,9 @@ function ensureWidgetStyles(): void {
 .context-bubble-widget.is-light .context-bubble-btn-hide,
 .context-bubble-widget.is-light .context-bubble-btn-close,
 .context-bubble-widget.is-light .context-bubble-btn-config,
-.context-bubble-widget.is-light .context-bubble-btn-theme {
+.context-bubble-widget.is-light .context-bubble-btn-theme,
+.context-bubble-widget.is-light .context-bubble-btn-send,
+.context-bubble-widget.is-light .context-bubble-btn-copy {
 	color: rgba(30, 40, 55, 0.85);
 }
 .context-bubble-widget.is-light .context-bubble-btn-hide:hover,
@@ -501,11 +545,14 @@ export class ContextBubbleWidget extends Disposable {
 	private readonly _slotsContainer: HTMLElement;
 	private readonly _resizeHandleElements: HTMLElement[] = [];
 	private readonly _disposables = this._register(new DisposableStore());
+	private _titleEl: HTMLElement | null = null;
 
 	private readonly _onDidMove = this._register(new Emitter<void>());
 	private readonly _onDidClose = this._register(new Emitter<void>());
 	private readonly _onDidInteract = this._register(new Emitter<void>());
 	private readonly _onDidRequestConfig = this._register(new Emitter<void>());
+	private readonly _onDidRequestSendToCopilot = this._register(new Emitter<void>());
+	private readonly _onDidRequestCopyToClipboard = this._register(new Emitter<void>());
 
 	/** Fires on every `mousemove` during a drag — use to update the arrow. */
 	readonly onDidMove: Event<void> = this._onDidMove.event;
@@ -518,6 +565,12 @@ export class ContextBubbleWidget extends Disposable {
 
 	/** Fires when the user clicks the configuration (gear) button. */
 	readonly onDidRequestConfig: Event<void> = this._onDidRequestConfig.event;
+
+	/** Fires when the user clicks the "Send to Copilot" button. */
+	readonly onDidRequestSendToCopilot: Event<void> = this._onDidRequestSendToCopilot.event;
+
+	/** Fires when the user clicks the "Copy to Clipboard" button. */
+	readonly onDidRequestCopyToClipboard: Event<void> = this._onDidRequestCopyToClipboard.event;
 
 	private _x = 100;
 	private _y = 100;
@@ -538,6 +591,12 @@ export class ContextBubbleWidget extends Disposable {
 		this._bindHover();
 		this._bindBorderHover();
 		this._bindInteract();
+		this._disposables.add(dom.addDisposableListener(mainWindow.document, 'keydown', e => {
+			if (this._visible && e.key === 'Escape') {
+				e.stopPropagation();
+				this.close();
+			}
+		}));
 	}
 
 	// -------------------------------------------------------------------------
@@ -628,20 +687,22 @@ export class ContextBubbleWidget extends Disposable {
 		const chrome = document.createElement('div');
 		chrome.className = 'context-bubble-chrome';
 
-		const title = document.createElement('span');
-		title.className = 'context-bubble-title';
-		title.textContent = 'Context Bubble';
+		this._titleEl = document.createElement('span');
+		this._titleEl.className = 'context-bubble-title';
+		this._titleEl.textContent = 'Context Bubble';
 
 		const controls = document.createElement('span');
 		controls.className = 'context-bubble-controls';
 
+		controls.appendChild(this._buildChromeButton('\u21e7', 'context-bubble-btn-send', () => this._onDidRequestSendToCopilot.fire(), 'Send to Copilot'));
+		controls.appendChild(this._buildChromeButton('\u29c9', 'context-bubble-btn-copy', () => this._onDidRequestCopyToClipboard.fire(), 'Copy to clipboard'));
 		const themeBtn = this._buildChromeButton('\u2600', 'context-bubble-btn-theme', () => this._toggleTheme(themeBtn));
 		controls.appendChild(themeBtn);
 		controls.appendChild(this._buildChromeButton('\u2699', 'context-bubble-btn-config', () => this._onDidRequestConfig.fire()));
 		controls.appendChild(this._buildChromeButton('\u2212', 'context-bubble-btn-hide', () => this.hide()));
 		controls.appendChild(this._buildChromeButton('\u00d7', 'context-bubble-btn-close', () => this.close()));
 
-		chrome.appendChild(title);
+		chrome.appendChild(this._titleEl);
 		chrome.appendChild(controls);
 
 		this._disposables.add(dom.addDisposableListener(chrome, 'mousedown', e => this._onDragStart(e)));
@@ -649,10 +710,20 @@ export class ContextBubbleWidget extends Disposable {
 		return chrome;
 	}
 
-	private _buildChromeButton(label: string, className: string, handler: () => void): HTMLElement {
+	/** Updates the chrome title to show the symbol name. */
+	setSymbolName(name: string): void {
+		if (this._titleEl) {
+			this._titleEl.textContent = name ? `Context Bubble \u00b7 ${name}` : 'Context Bubble';
+		}
+	}
+
+	private _buildChromeButton(label: string, className: string, handler: () => void, tooltip?: string): HTMLElement {
 		const btn = document.createElement('button');
 		btn.className = className;
 		btn.textContent = label;
+		if (tooltip) {
+			btn.title = tooltip;
+		}
 		this._disposables.add(dom.addDisposableListener(btn, 'click', e => {
 			e.stopPropagation();
 			handler();

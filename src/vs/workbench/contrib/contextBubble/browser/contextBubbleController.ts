@@ -42,6 +42,10 @@ import { INativeHostService } from '../../../../platform/native/common/native.js
 import { INotificationService, Severity } from '../../../../platform/notification/common/notification.js';
 import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js';
 import { IFileService } from '../../../../platform/files/common/files.js';
+import { IViewsService } from '../../../services/views/common/viewsService.js';
+import { IChatWidgetService, ChatViewId } from '../../chat/browser/chat.js';
+import { IPromptTextVariableEntry } from '../../chat/common/attachments/chatVariableEntries.js';
+import { ChatAgentLocation } from '../../chat/common/constants.js';
 
 export const CONTEXT_BUBBLE_COMMAND_ID = 'contextBubble.trigger';
 
@@ -571,6 +575,8 @@ export class ContextBubbleController extends Disposable {
 		@INotificationService private readonly _notificationService: INotificationService,
 		@IWorkspaceContextService private readonly _workspaceContextService: IWorkspaceContextService,
 		@IFileService private readonly _fileService: IFileService,
+		@IViewsService private readonly _viewsService: IViewsService,
+		@IChatWidgetService private readonly _chatWidgetService: IChatWidgetService,
 	) {
 		super();
 		this._register(CommandsRegistry.registerCommand(CONTEXT_BUBBLE_COMMAND_ID, () => {
@@ -822,6 +828,15 @@ export class ContextBubbleController extends Disposable {
 
 		// Gear icon → open slot config overlay
 		this._sessionDisposables.add(bubble.onDidRequestConfig(() => this._openConfigOverlay(bubble)));
+
+		// Send button (\u21e7) → send bubble context to Copilot chat
+		this._sessionDisposables.add(bubble.onDidRequestSendToCopilot(() => this._sendToCopilot()));
+
+		// Copy button (\u29c9) → copy bubble context to clipboard
+		this._sessionDisposables.add(bubble.onDidRequestCopyToClipboard(() => this._copyToClipboard()));
+
+		// Show symbol name in chrome title
+		bubble.setSymbolName(this._currentSymbolName);
 
 		bubble.show();
 	}
@@ -2259,6 +2274,74 @@ export class ContextBubbleController extends Disposable {
 			position,
 			symbolTypeHint,
 		};
+	}
+
+	// -------------------------------------------------------------------------
+	// Send to Copilot
+	// -------------------------------------------------------------------------
+
+	private async _sendToCopilot(): Promise<void> {
+		const text = this._buildContextSummaryText();
+		if (!text) {
+			this._notificationService.notify({
+				severity: Severity.Info,
+				message: nls.localize('sendToCopilot.noData', 'No context data available yet — wait for slots to finish loading.'),
+			});
+			return;
+		}
+
+		const entry: IPromptTextVariableEntry = {
+			kind: 'promptText',
+			id: `contextBubble.${Date.now()}`,
+			name: nls.localize('sendToCopilot.attachmentName', 'Context Bubble: {0}', this._currentSymbolName ?? 'symbol'),
+			value: text,
+			modelDescription: text,
+			automaticallyAdded: false,
+		};
+
+		const view = await this._viewsService.openView(ChatViewId, true);
+		if (!view) {
+			return;
+		}
+
+		const widget = this._chatWidgetService.lastFocusedWidget
+			?? this._chatWidgetService.getWidgetsByLocations(ChatAgentLocation.Chat)[0];
+		if (!widget) {
+			return;
+		}
+
+		widget.attachmentModel.addContext(entry);
+		widget.focusInput();
+	}
+
+	private _buildContextSummaryText(): string | undefined {
+		const sections: string[] = [];
+		if (this._currentSymbolName) {
+			sections.push(`# Context Bubble: \`${this._currentSymbolName}\``);
+		}
+		for (const slot of this._slotInstances.values()) {
+			const summary = slot.getContextSummary();
+			if (summary) {
+				sections.push(summary);
+			}
+		}
+		return sections.length > 1 ? sections.join('\n\n') : undefined;
+	}
+
+	private async _copyToClipboard(): Promise<void> {
+		const text = this._buildContextSummaryText();
+		if (!text) {
+			this._notificationService.notify({
+				severity: Severity.Info,
+				message: nls.localize('copyToClipboard.noData', 'No context data available yet — wait for slots to finish loading.'),
+			});
+			return;
+		}
+		await mainWindow.navigator.clipboard.writeText(text);
+		this._notificationService.notify({
+			severity: Severity.Info,
+			message: nls.localize('copyToClipboard.success', 'Context for \'{0}\' copied to clipboard.', this._currentSymbolName ?? 'symbol'),
+		});
 	}
 
 	// -------------------------------------------------------------------------

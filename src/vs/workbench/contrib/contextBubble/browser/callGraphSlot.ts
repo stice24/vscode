@@ -293,6 +293,21 @@ export class CallGraphSlot extends SlotComponent {
 		// History bar is managed externally by the controller via updateHistoryBar().
 	}
 
+	override getContextSummary(): string {
+		const data = this._lastRenderedData;
+		if (!data) {
+			return '';
+		}
+		const parts: string[] = [`**Call Graph: ${this._symbolName}**`];
+		if (data.callers.length > 0) {
+			parts.push(`- Callers: ${data.callers.join(', ')}`);
+		}
+		if (data.callees.length > 0) {
+			parts.push(`- Callees: ${data.callees.join(', ')}`);
+		}
+		return parts.join('\n');
+	}
+
 	// -------------------------------------------------------------------------
 	// Internal graph helpers
 	// -------------------------------------------------------------------------

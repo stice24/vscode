@@ -387,8 +387,11 @@ export class SlackMentionsSlot extends SlotComponent {
 	 * Always call `setConnectedState(true, ...)` before this so header controls
 	 * are in sync.
 	 */
+	private _lastRenderedMessages: SlackMessage[] | null = null;
+
 	override renderContent(data: unknown): void {
 		const messages = data as SlackMessage[];
+		this._lastRenderedMessages = messages;
 		this.setState('success');
 		this._clearOwnedContent();
 
@@ -398,6 +401,18 @@ export class SlackMentionsSlot extends SlotComponent {
 		}
 
 		this._renderCards(messages);
+	}
+
+	override getContextSummary(): string {
+		const messages = this._lastRenderedMessages;
+		if (!messages || messages.length === 0) {
+			return '';
+		}
+		const lines = messages.map(m => {
+			const channel = m.channelName ? ` in #${m.channelName}` : '';
+			return `- @${m.username}${channel} (${m.relativeTime}): ${m.content}`;
+		});
+		return `**Slack Mentions**\n${lines.join('\n')}`;
 	}
 
 	// -------------------------------------------------------------------------

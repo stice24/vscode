@@ -157,6 +157,7 @@ export class GitHistorySlot extends SlotComponent {
 
 	/** The currently rendered commit list element. Replaced on each renderContent call. */
 	private _listEl: HTMLElement | null = null;
+	private _lastRenderedCommits: CommitEntry[] | null = null;
 
 	constructor(container: HTMLElement) {
 		super(container, 'Git History');
@@ -165,10 +166,20 @@ export class GitHistorySlot extends SlotComponent {
 
 	override renderContent(data: unknown): void {
 		const commits = data as CommitEntry[];
+		this._lastRenderedCommits = commits;
 		this._listEl?.remove();
 		this._listEl = null;
 		this.setState('success');
 		this._renderList(commits);
+	}
+
+	override getContextSummary(): string {
+		const commits = this._lastRenderedCommits;
+		if (!commits || commits.length === 0) {
+			return '';
+		}
+		const lines = commits.map(c => `- \`${c.hash}\` ${c.message} (${c.author}, ${c.relativeTime})`);
+		return `**Git History**\n${lines.join('\n')}`;
 	}
 
 	private _renderList(commits: CommitEntry[]): void {
