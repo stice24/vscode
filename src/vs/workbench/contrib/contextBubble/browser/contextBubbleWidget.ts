@@ -233,27 +233,6 @@ function ensureWidgetStyles(): void {
 	background: rgba(80, 200, 220, 0.15);
 }
 
-/* ---- Copy to clipboard button in chrome ---- */
-.context-bubble-btn-copy {
-	background: none;
-	border: none;
-	cursor: pointer;
-	color: rgba(80, 200, 220, 0.9);
-	font-size: 13px;
-	line-height: 1;
-	padding: 2px 5px;
-	border-radius: 3px;
-	opacity: 0.5;
-	transition: opacity 0.15s, background 0.1s;
-}
-.context-bubble-widget.is-hovered .context-bubble-btn-copy {
-	opacity: 0.85;
-}
-.context-bubble-btn-copy:hover {
-	opacity: 1 !important;
-	background: rgba(80, 200, 220, 0.15);
-}
-
 /* ---- Config button in chrome ---- */
 .context-bubble-btn-config {
 	background: none;
@@ -327,8 +306,7 @@ function ensureWidgetStyles(): void {
 .context-bubble-widget.is-light .context-bubble-btn-close,
 .context-bubble-widget.is-light .context-bubble-btn-config,
 .context-bubble-widget.is-light .context-bubble-btn-theme,
-.context-bubble-widget.is-light .context-bubble-btn-send,
-.context-bubble-widget.is-light .context-bubble-btn-copy {
+.context-bubble-widget.is-light .context-bubble-btn-send {
 	color: rgba(30, 40, 55, 0.85);
 }
 .context-bubble-widget.is-light .context-bubble-btn-hide:hover,
@@ -552,7 +530,6 @@ export class ContextBubbleWidget extends Disposable {
 	private readonly _onDidInteract = this._register(new Emitter<void>());
 	private readonly _onDidRequestConfig = this._register(new Emitter<void>());
 	private readonly _onDidRequestSendToCopilot = this._register(new Emitter<void>());
-	private readonly _onDidRequestCopyToClipboard = this._register(new Emitter<void>());
 
 	/** Fires on every `mousemove` during a drag — use to update the arrow. */
 	readonly onDidMove: Event<void> = this._onDidMove.event;
@@ -568,9 +545,6 @@ export class ContextBubbleWidget extends Disposable {
 
 	/** Fires when the user clicks the "Send to Copilot" button. */
 	readonly onDidRequestSendToCopilot: Event<void> = this._onDidRequestSendToCopilot.event;
-
-	/** Fires when the user clicks the "Copy to Clipboard" button. */
-	readonly onDidRequestCopyToClipboard: Event<void> = this._onDidRequestCopyToClipboard.event;
 
 	private _x = 100;
 	private _y = 100;
@@ -695,7 +669,6 @@ export class ContextBubbleWidget extends Disposable {
 		controls.className = 'context-bubble-controls';
 
 		controls.appendChild(this._buildChromeButton('\u21e7', 'context-bubble-btn-send', () => this._onDidRequestSendToCopilot.fire(), 'Send to Copilot'));
-		controls.appendChild(this._buildChromeButton('\u29c9', 'context-bubble-btn-copy', () => this._onDidRequestCopyToClipboard.fire(), 'Copy to clipboard'));
 		const themeBtn = this._buildChromeButton('\u2600', 'context-bubble-btn-theme', () => this._toggleTheme(themeBtn));
 		controls.appendChild(themeBtn);
 		controls.appendChild(this._buildChromeButton('\u2699', 'context-bubble-btn-config', () => this._onDidRequestConfig.fire()));

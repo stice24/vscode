@@ -832,9 +832,6 @@ export class ContextBubbleController extends Disposable {
 		// Send button (\u21e7) → send bubble context to Copilot chat
 		this._sessionDisposables.add(bubble.onDidRequestSendToCopilot(() => this._sendToCopilot()));
 
-		// Copy button (\u29c9) → copy bubble context to clipboard
-		this._sessionDisposables.add(bubble.onDidRequestCopyToClipboard(() => this._copyToClipboard()));
-
 		// Show symbol name in chrome title
 		bubble.setSymbolName(this._currentSymbolName);
 
@@ -2326,22 +2323,6 @@ export class ContextBubbleController extends Disposable {
 			}
 		}
 		return sections.length > 1 ? sections.join('\n\n') : undefined;
-	}
-
-	private async _copyToClipboard(): Promise<void> {
-		const text = this._buildContextSummaryText();
-		if (!text) {
-			this._notificationService.notify({
-				severity: Severity.Info,
-				message: nls.localize('copyToClipboard.noData', 'No context data available yet — wait for slots to finish loading.'),
-			});
-			return;
-		}
-		await mainWindow.navigator.clipboard.writeText(text);
-		this._notificationService.notify({
-			severity: Severity.Info,
-			message: nls.localize('copyToClipboard.success', 'Context for \'{0}\' copied to clipboard.', this._currentSymbolName ?? 'symbol'),
-		});
 	}
 
 	// -------------------------------------------------------------------------
