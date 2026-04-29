@@ -1,0 +1,66 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+# CODEATTRIBUTIONS
+# Context Bubble — AI Usage Notes
+# Author: stice24
+# Date: 2026-04-28
+
+--------------------------------------------------------------------------------
+
+Used Claude Code (Anthropic) as a coding assistant across all 9 sessions of this project. These are notes on where AI actually helped and where I was in the weeds myself.
+
+--------------------------------------------------------------------------------
+
+## Where Claude actually helped
+
+**contextBubbleController.ts — symbol extraction**
+The multi-strategy symbol resolution (_resolveSymbolFromSelection, strategies 1-4)
+was drafted with AI help. The regex for named function keyword, class keyword,
+and identifier-before-paren are all in there. I understood what each strategy
+was doing and kept them, but I wouldn't have written that brace-counting logic
+in _findFunctionBodyRange from scratch quickly. Also the fallback
+_fetchCallGraphViaText — the scanning logic for callers/callees via text
+pattern matching when LSP isn't available was AI-assisted.
+
+**contextBubbleArrow.ts — bezier curve**
+The control point math for the SVG bezier connecting the anchor to the bubble
+was drafted by Claude. I knew what I wanted visually (a curve that felt natural
+regardless of where you dragged the bubble) but the dynamic control point
+calculation was easier to iterate on with AI generating a starting point.
+
+**callGraphSlot.ts — LSP wiring**
+Getting the CallHierarchyProvider working, including the fallback chain to
+ReferenceProvider + DefinitionProvider, involved a lot of navigating VS Code's
+internal provider interfaces. Claude helped me find the right service hooks and
+draft the provider resolution. I caught a bug where the fallback was running
+even when call hierarchy was available and fixed that myself.
+
+**gitHistorySlot.ts — git service integration**
+Claude drafted the initial git service wiring. The decision to scope queries to
+file + line range was mine, but finding the right internal service interface in
+Code OSS to do that without shelling out directly — Claude helped locate that.
+parseMessage() for extracting PR refs from commit messages is fully Claude-generated.
+
+**slackMentionsSlot.ts — Slack API fetch + auth**
+The Slack Search API fetch logic and the token retrieval from VS Code settings
+was drafted with AI assistance. The channel picker UI, the connect/disconnect
+state flow, and the slack:// deep-link behavior — I wrote and iterated those
+myself.
+
+**Disposal boilerplate across all files**
+The DisposableStore and IDisposable patterns used throughout are heavily informed
+by Claude knowing the VS Code service layer. I would have learned it eventually
+but it would have taken longer.
+
+--------------------------------------------------------------------------------
+
+## General note
+
+I reviewed every block of generated code before accepting it. Several suggested approaches got rejected outright — early on Claude wanted to use a webview panel
+for the bubble, extend existing overlay widgets instead of building custom DOM, and shell out to git directly. All of those got thrown out. The architecture
+decisions in CLAUDE.md reflect what I actually wanted to build, and I used that doc to keep the AI on track rather than letting it design the thing.
+
+--------------------------------------------------------------------------------
